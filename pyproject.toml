@@ -10,6 +10,8 @@ dependencies = [
     "loguru",
     "PySnooper",
     "requests",
+    "pandas>=3.0.2",
+    "matplotlib>=3.10.8",
 ]
 requires-python = ">=3.13"
 license = {text = "UNLICENCE"}
