@@ -55,35 +55,61 @@ def fetch_btc_prices() -> pd.Series:
     return series
 
 
-def parse_macromicro_series(payload: object) -> pd.Series:
-    data: object = payload
-    if isinstance(payload, dict):
-        if "data" in payload:
-            data = payload["data"]
-            if isinstance(data, dict):
-                if "data" in data:
-                    data = data["data"]
-                elif len(data) == 1:
-                    container = next(iter(data.values()))
-                    if isinstance(container, dict) and "series" in container:
-                        series_block = container["series"]
-                        if isinstance(series_block, list) and series_block:
-                            first = series_block[0]
-                            if (
-                                isinstance(first, list)
-                                and first
-                                and isinstance(first[0], (list, tuple))
-                            ):
-                                data = first
-                            else:
-                                data = series_block
-        elif "chartData" in payload:
-            data = payload["chartData"]
-        else:
-            raise ValueError("Unexpected MacroMicro payload shape.")
-
+def is_macromicro_point_list(data: object) -> bool:
     if not isinstance(data, list) or not data:
-        raise ValueError("MacroMicro payload contains no data points.")
+        return False
+    first = data[0]
+    if isinstance(first, dict):
+        has_date = any(key in first for key in ("date", "t", "x"))
+        has_value = any(key in first for key in ("value", "v", "y"))
+        return has_date and has_value
+    if not isinstance(first, (list, tuple)) or len(first) < 2:
+        return False
+    return not isinstance(first[0], (list, tuple, dict)) and not isinstance(
+        first[1], (list, tuple, dict)
+    )
+
+
+def find_macromicro_points(node: object) -> list[object] | None:
+    if is_macromicro_point_list(node):
+        return node
+
+    if isinstance(node, dict):
+        for key in ("data", "series", "chartData", "values", "value"):
+            if key in node:
+                series = find_macromicro_points(node[key])
+                if series is not None:
+                    return series
+        for value in node.values():
+            series = find_macromicro_points(value)
+            if series is not None:
+                return series
+        return None
+
+    if isinstance(node, list):
+        for item in node:
+            series = find_macromicro_points(item)
+            if series is not None:
+                return series
+
+    return None
+
+
+def describe_macromicro_payload(payload: object) -> str:
+    if isinstance(payload, dict):
+        return f"top-level keys: {sorted(payload.keys())}"
+    if isinstance(payload, list):
+        return f"top-level list length: {len(payload)}"
+    return f"top-level type: {type(payload).__name__}"
+
+
+def parse_macromicro_series(payload: object) -> pd.Series:
+    data = find_macromicro_points(payload)
+    if data is None:
+        raise ValueError(
+            "MacroMicro payload contains no parseable data points "
+            f"({describe_macromicro_payload(payload)})."
+        )
 
     first = data[0]
     if isinstance(first, dict):
@@ -224,9 +250,7 @@ def align_series(global_m2: pd.Series, btc_usd: pd.Series) -> pd.DataFrame:
     return combined
 
 
-def add_rolling_correlation(
-    combined: pd.DataFrame, window_months: int
-) -> pd.DataFrame:
+def add_rolling_correlation(combined: pd.DataFrame, window_months: int) -> pd.DataFrame:
     if window_months < 2:
         raise ValueError("correlationWindowMonths must be >= 2.")
     combined = combined.copy()
