@@ -36,6 +36,13 @@ class ActivityRequest:
     hours: float | None
 
 
+@dataclass(frozen=True)
+class LoggedActivity:
+    activity: str
+    start: datetime
+    end: datetime
+
+
 def local_now() -> datetime:
     return datetime.now().astimezone()
 
@@ -84,6 +91,10 @@ def normalize_activity_name(activity: str, last_activity: str | None) -> str:
     if not previous_activity:
         raise ValueError("'.' needs a previous activity, but none is recorded.")
     return previous_activity
+
+
+def activity_key(activity: str) -> str:
+    return "".join(activity.split()).casefold()
 
 
 def parse_activity_requests(
@@ -174,16 +185,158 @@ def load_state(log_dir: Path, now: datetime) -> dict[str, object]:
             "cursor_time": cursor_time.isoformat(),
             "last_activity": "",
             "last_activity_end": "",
+            "last_activity_run_start": "",
         }
 
     with state_path.open("r", encoding="utf-8") as state_file:
         state = json.load(state_file)
     if not isinstance(state, dict):
         raise ValueError(f"State file must contain an object: {state_path}")
-    return state
+    return backfill_last_activity_run_start(log_dir, state)
 
 
-def save_state(log_dir: Path, segment: ActivitySegment) -> None:
+def same_log_minute(left: datetime, right: datetime) -> bool:
+    return left.replace(second=0, microsecond=0) == right.replace(
+        second=0,
+        microsecond=0,
+    )
+
+
+def parse_log_segment(log_path: Path, line: str, tzinfo) -> LoggedActivity:
+    time_range, _hours_text, activity = line.rstrip("\n").split(None, 2)
+    start_text, end_text = time_range.split("-", 1)
+    log_date = datetime.strptime(log_path.stem, "%Y-%m-%d").date()
+    start_time = datetime.strptime(start_text, "%H:%M").time()
+    end_time = datetime.strptime(end_text, "%H:%M").time()
+    start = datetime.combine(log_date, start_time, tzinfo=tzinfo)
+    end = datetime.combine(log_date, end_time, tzinfo=tzinfo)
+    if end <= start:
+        end += timedelta(days=1)
+    return LoggedActivity(activity=activity, start=start, end=end)
+
+
+def read_logged_activities(log_dir: Path, tzinfo) -> list[LoggedActivity]:
+    logged_activities: list[LoggedActivity] = []
+    for log_path in sorted(log_dir.glob("*.txt")):
+        for line_number, line in enumerate(
+            log_path.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
+            if not line.strip():
+                continue
+            try:
+                logged_activities.append(parse_log_segment(log_path, line, tzinfo))
+            except ValueError as error:
+                print(
+                    f"Warning: skipping malformed log line {log_path}:{line_number}: {error}",
+                    file=sys.stderr,
+                )
+    return sorted(logged_activities, key=lambda activity: activity.start)
+
+
+def find_run_start_in_logs(
+    logged_activities: list[LoggedActivity],
+    last_activity: str,
+    last_activity_end: datetime,
+) -> datetime | None:
+    target_key = activity_key(last_activity)
+    matching_index = None
+    for activity_index, logged_activity in enumerate(logged_activities):
+        if activity_key(logged_activity.activity) != target_key:
+            continue
+        if same_log_minute(logged_activity.end, last_activity_end):
+            matching_index = activity_index
+
+    if matching_index is None:
+        return None
+
+    run_start = logged_activities[matching_index].start
+    for previous_activity in reversed(logged_activities[:matching_index]):
+        if previous_activity.end != run_start:
+            break
+        if activity_key(previous_activity.activity) != target_key:
+            break
+        run_start = previous_activity.start
+    return run_start
+
+
+def backfill_last_activity_run_start(
+    log_dir: Path,
+    state: dict[str, object],
+) -> dict[str, object]:
+    if str(state.get("last_activity_run_start") or "").strip():
+        return state
+
+    last_activity = str(state.get("last_activity") or "").strip()
+    last_activity_end_text = state.get("last_activity_end")
+    if not last_activity or not isinstance(last_activity_end_text, str):
+        return state
+    if not last_activity_end_text.strip():
+        return state
+
+    last_activity_end = parse_iso_datetime(last_activity_end_text, "last_activity_end")
+    run_start = find_run_start_in_logs(
+        read_logged_activities(log_dir, last_activity_end.tzinfo),
+        last_activity,
+        last_activity_end,
+    )
+    if run_start is None:
+        print(
+            "Warning: could not backfill last activity run duration from time logs.",
+            file=sys.stderr,
+        )
+        return state
+
+    updated_state = dict(state)
+    updated_state["last_activity_run_start"] = run_start.isoformat()
+    return updated_state
+
+
+def current_run_start(
+    segments: list[ActivitySegment],
+    previous_state: dict[str, object],
+) -> datetime:
+    final_segment = segments[-1]
+    final_key = activity_key(final_segment.activity)
+    run_start = final_segment.start
+
+    for segment in reversed(segments[:-1]):
+        if segment.end != run_start:
+            break
+        if activity_key(segment.activity) != final_key:
+            break
+        run_start = segment.start
+
+    previous_activity = previous_state.get("last_activity")
+    previous_activity_end = previous_state.get("last_activity_end")
+    previous_run_start = previous_state.get("last_activity_run_start")
+    if (
+        run_start == segments[0].start
+        and isinstance(previous_activity, str)
+        and activity_key(previous_activity) == final_key
+        and isinstance(previous_activity_end, str)
+        and isinstance(previous_run_start, str)
+        and previous_run_start.strip()
+    ):
+        parsed_previous_end = parse_iso_datetime(
+            previous_activity_end,
+            "last_activity_end",
+        )
+        if parsed_previous_end == run_start:
+            return parse_iso_datetime(
+                previous_run_start,
+                "last_activity_run_start",
+            )
+
+    return run_start
+
+
+def save_state(
+    log_dir: Path,
+    segments: list[ActivitySegment],
+    previous_state: dict[str, object],
+) -> None:
+    segment = segments[-1]
     state_path = log_dir / STATE_FILE_NAME
     state_path.write_text(
         json.dumps(
@@ -191,6 +344,10 @@ def save_state(log_dir: Path, segment: ActivitySegment) -> None:
                 "cursor_time": segment.end.isoformat(),
                 "last_activity": segment.activity,
                 "last_activity_end": segment.end.isoformat(),
+                "last_activity_run_start": current_run_start(
+                    segments,
+                    previous_state,
+                ).isoformat(),
             },
             indent=2,
         )
@@ -237,10 +394,9 @@ def format_clock_time(value: datetime) -> str:
     return f"{hour}:{value.minute:02d}{suffix}"
 
 
-def format_elapsed_hours(duration: timedelta) -> str:
+def format_display_hours(duration: timedelta) -> str:
     hours = max(0, duration.total_seconds()) / 3600
-    formatted_hours = f"{hours:.2f}".rstrip("0").rstrip(".")
-    return f"{formatted_hours}h"
+    return f"{hours:.1f}h"
 
 
 def popup_text(
@@ -252,15 +408,32 @@ def popup_text(
     last_activity = str(state.get("last_activity") or "none")
     last_activity_end = state.get("last_activity_end")
     if isinstance(last_activity_end, str) and last_activity_end.strip():
-        last_activity_end_text = format_clock_time(
-            parse_iso_datetime(last_activity_end, "last_activity_end")
+        parsed_last_activity_end = parse_iso_datetime(
+            last_activity_end,
+            "last_activity_end",
         )
+        last_activity_end_text = format_clock_time(parsed_last_activity_end)
     else:
+        parsed_last_activity_end = None
         last_activity_end_text = "none"
 
+    last_activity_run_start = state.get("last_activity_run_start")
+    if (
+        parsed_last_activity_end is not None
+        and isinstance(last_activity_run_start, str)
+        and last_activity_run_start.strip()
+    ):
+        run_start = parse_iso_datetime(
+            last_activity_run_start,
+            "last_activity_run_start",
+        )
+        duration_text = f" ({format_display_hours(parsed_last_activity_end - run_start)})"
+    else:
+        duration_text = ""
+
     status_line = html.escape(
-        f"Last: {last_activity} @ {last_activity_end_text} "
-        f"({format_elapsed_hours(now - period_start)} ago)"
+        f"Last: {last_activity}{duration_text} @ {last_activity_end_text} "
+        f"({format_display_hours(now - period_start)} ago)"
     )
     error_block = (
         f'<span foreground="red"><b>Error:</b> {html.escape(error_message)}</span>\n\n'
@@ -332,7 +505,7 @@ def run(notes_dir: Path, now: datetime) -> int:
             error_message = f"{error} No time was logged."
 
     append_segments(log_dir, segments)
-    save_state(log_dir, segments[-1])
+    save_state(log_dir, segments, state)
     return 0
 
 

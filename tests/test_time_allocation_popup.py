@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -36,6 +37,10 @@ def segment_tuples(segments):
     ]
 
 
+def read_state(log_dir: Path) -> dict:
+    return json.loads((log_dir / "state.json").read_text(encoding="utf-8"))
+
+
 def test_activity_without_duration_fills_whole_period() -> None:
     segments = time_allocation_popup.parse_activity_segments("brunch", at(10), at(15))
 
@@ -47,12 +52,13 @@ def test_popup_header_uses_compact_record_fields() -> None:
         {
             "last_activity": "Clean room",
             "last_activity_end": at(20, 20).isoformat(),
+            "last_activity_run_start": at(17, 50).isoformat(),
         },
-        at(18, 40),
-        at(20),
+        at(20, 20),
+        at(22),
     )
 
-    assert "Last: Clean room @ 8:20pm (1.33h ago)" in text
+    assert "Last: Clean room (2.5h) @ 8:20pm (1.7h ago)" in text
     assert "Last record:" not in text
     assert "Last record end:" not in text
     assert "Time since:" not in text
@@ -160,6 +166,76 @@ def test_daily_log_splits_segments_at_midnight(tmp_path: Path) -> None:
 
     assert (tmp_path / "2026-07-02.txt").read_text(encoding="utf-8") == "23:30-00:00  0.50h  work\n"
     assert (tmp_path / "2026-07-03.txt").read_text(encoding="utf-8") == "00:00-00:30  0.50h  work\n"
+
+
+def test_save_state_continues_previous_run_case_and_space_insensitive(tmp_path: Path) -> None:
+    previous_state = {
+        "last_activity": "Clean room",
+        "last_activity_end": at(11).isoformat(),
+        "last_activity_run_start": at(10).isoformat(),
+    }
+    segments = [time_allocation_popup.ActivitySegment("cleanroom", at(11), at(12))]
+
+    time_allocation_popup.save_state(tmp_path, segments, previous_state)
+
+    assert read_state(tmp_path)["last_activity_run_start"] == at(10).isoformat()
+
+
+def test_save_state_combines_adjacent_current_segments_case_and_space_insensitive(tmp_path: Path) -> None:
+    previous_state = {
+        "last_activity": "work",
+        "last_activity_end": at(11).isoformat(),
+        "last_activity_run_start": at(10).isoformat(),
+    }
+    segments = [
+        time_allocation_popup.ActivitySegment("Clean room", at(11), at(12)),
+        time_allocation_popup.ActivitySegment("cleanroom", at(12), at(13)),
+    ]
+
+    time_allocation_popup.save_state(tmp_path, segments, previous_state)
+
+    assert read_state(tmp_path)["last_activity_run_start"] == at(11).isoformat()
+
+
+def test_save_state_intervening_activity_resets_matching_previous_run(tmp_path: Path) -> None:
+    previous_state = {
+        "last_activity": "Clean room",
+        "last_activity_end": at(11).isoformat(),
+        "last_activity_run_start": at(10).isoformat(),
+    }
+    segments = [
+        time_allocation_popup.ActivitySegment("work", at(11), at(12)),
+        time_allocation_popup.ActivitySegment("cleanroom", at(12), at(13)),
+    ]
+
+    time_allocation_popup.save_state(tmp_path, segments, previous_state)
+
+    assert read_state(tmp_path)["last_activity_run_start"] == at(12).isoformat()
+
+
+def test_load_state_backfills_legacy_run_start_from_logs(tmp_path: Path) -> None:
+    time_allocation_popup.append_segments(
+        tmp_path,
+        [
+            time_allocation_popup.ActivitySegment("work", at(17), at(17, 30)),
+            time_allocation_popup.ActivitySegment("Clean room", at(17, 30), at(19)),
+            time_allocation_popup.ActivitySegment("cleanroom", at(19), at(20, 20)),
+        ],
+    )
+    (tmp_path / "state.json").write_text(
+        json.dumps(
+            {
+                "cursor_time": at(20, 20).isoformat(),
+                "last_activity": "Clean room",
+                "last_activity_end": at(20, 20).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = time_allocation_popup.load_state(tmp_path, at(21))
+
+    assert state["last_activity_run_start"] == at(17, 30).isoformat()
 
 
 def test_invalid_input_reopens_prompt_with_previous_text(monkeypatch, tmp_path: Path) -> None:
