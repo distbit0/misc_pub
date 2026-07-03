@@ -19,6 +19,8 @@ NOTES_DIR = Path.home() / "notes"
 LOG_DIR_NAME = "time-allocation"
 LOG_FILE_NAME = "time-allocation.txt"
 STATE_FILE_NAME = "state.json"
+LOG_ACTION = "log"
+REVIEW_ACTION = "review"
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,12 @@ class LoggedActivity:
     activity: str
     start: datetime
     end: datetime
+
+
+@dataclass(frozen=True)
+class PopupResponse:
+    action: str
+    text: str
 
 
 def local_now() -> datetime:
@@ -464,12 +472,22 @@ def log_line(segment: ActivitySegment) -> str:
     )
 
 
+def segment_log_lines(segments: list[ActivitySegment]) -> list[str]:
+    lines: list[str] = []
+    for segment in segments:
+        for day_segment in split_segment_by_day(segment):
+            lines.append(log_line(day_segment))
+    return lines
+
+
+def segments_log_text(segments: list[ActivitySegment]) -> str:
+    return "".join(f"{line}\n" for line in segment_log_lines(segments))
+
+
 def append_segments(log_dir: Path, segments: list[ActivitySegment]) -> None:
     log_path = log_dir / LOG_FILE_NAME
     with log_path.open("a", encoding="utf-8") as log_file:
-        for segment in segments:
-            for day_segment in split_segment_by_day(segment):
-                log_file.write(log_line(day_segment) + "\n")
+        log_file.write(segments_log_text(segments))
 
 
 def format_clock_time(value: datetime) -> str:
@@ -490,6 +508,7 @@ def popup_text(
     period_start: datetime,
     now: datetime,
     error_message: str | None = None,
+    review_text: str | None = None,
 ) -> str:
     last_activity = str(state.get("last_activity") or "none")
     last_activity_end = state.get("last_activity_end")
@@ -526,6 +545,12 @@ def popup_text(
         if error_message
         else ""
     )
+    review_block = (
+        f'\n\n<span font_desc="Monospace 18"><b>Would append:</b>\n'
+        f"{html.escape(review_text.rstrip())}</span>"
+        if review_text
+        else ""
+    )
     help_text = html.escape(
         "CSV: activity | activity,hours | activity,end time | . repeats last activity\n"
         "Examples: brunch | brunch, 2 | sleep, 9.5am | ., 3, relax\n"
@@ -533,11 +558,11 @@ def popup_text(
     )
     return (
         f'{error_block}<span font_desc="{POPUP_FONT}"><b>{status_line}</b></span>'
-        f'\n\n<span font_desc="{POPUP_FONT}">{help_text}</span>'
+        f'\n\n<span font_desc="{POPUP_FONT}">{help_text}</span>{review_block}'
     )
 
 
-def ask_with_yad(message: str, entry_text: str = "") -> str | None:
+def ask_with_yad(message: str, entry_text: str = "") -> PopupResponse | None:
     command = [
         "yad",
         "--entry",
@@ -551,12 +576,15 @@ def ask_with_yad(message: str, entry_text: str = "") -> str | None:
         f"--timeout={POPUP_TIMEOUT_SECONDS}",
         "--timeout-indicator=bottom",
         "--button=Cancel:1",
+        "--button=Review:2",
         "--button=Log:0",
     ]
     completed = subprocess.run(command, text=True, capture_output=True, check=False)
-    if completed.returncode != 0:
-        return None
-    return completed.stdout.strip()
+    if completed.returncode == 0:
+        return PopupResponse(action=LOG_ACTION, text=completed.stdout.strip())
+    if completed.returncode == 2:
+        return PopupResponse(action=REVIEW_ACTION, text=completed.stdout.strip())
+    return None
 
 
 def run(notes_dir: Path, now: datetime) -> int:
@@ -570,13 +598,15 @@ def run(notes_dir: Path, now: datetime) -> int:
 
     entry_text = ""
     error_message = None
+    review_text = None
     while True:
-        raw_input = ask_with_yad(
-            popup_text(state, period_start, now, error_message),
+        response = ask_with_yad(
+            popup_text(state, period_start, now, error_message, review_text),
             entry_text,
         )
-        if raw_input is None or not raw_input.strip():
+        if response is None or not response.text.strip():
             return 0
+        raw_input = response.text
         entry_text = raw_input
         last_activity = state.get("last_activity")
         try:
@@ -586,9 +616,17 @@ def run(notes_dir: Path, now: datetime) -> int:
                 now,
                 str(last_activity) if isinstance(last_activity, str) else None,
             )
-            break
         except ValueError as error:
             error_message = f"{error} No time was logged."
+            review_text = None
+            continue
+
+        if response.action == REVIEW_ACTION:
+            error_message = None
+            review_text = segments_log_text(segments)
+            continue
+
+        break
 
     append_segments(log_dir, segments)
     save_state(log_dir, segments, state)

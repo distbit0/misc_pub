@@ -320,9 +320,23 @@ def test_load_state_backfills_run_start_from_single_log_file(tmp_path: Path) -> 
 
 def test_invalid_input_reopens_prompt_with_previous_text(monkeypatch, tmp_path: Path) -> None:
     prompts: list[tuple[str, str]] = []
-    responses = iter(["brunch,work", "brunch,1"])
+    responses = iter(
+        [
+            time_allocation_popup.PopupResponse(
+                time_allocation_popup.LOG_ACTION,
+                "brunch,work",
+            ),
+            time_allocation_popup.PopupResponse(
+                time_allocation_popup.LOG_ACTION,
+                "brunch,1",
+            ),
+        ]
+    )
 
-    def fake_ask_with_yad(message: str, entry_text: str = "") -> str:
+    def fake_ask_with_yad(
+        message: str,
+        entry_text: str = "",
+    ) -> time_allocation_popup.PopupResponse:
         prompts.append((message, entry_text))
         return next(responses)
 
@@ -337,3 +351,64 @@ def test_invalid_input_reopens_prompt_with_previous_text(monkeypatch, tmp_path: 
     assert "Error:" in prompts[1][0]
     log_path = tmp_path / "time-allocation" / "time-allocation.txt"
     assert log_path.read_text(encoding="utf-8") == "2026-07-02 10:30-11:00  0.50h  brunch\n"
+
+
+def test_review_reopens_prompt_with_preview_and_preserved_text(monkeypatch, tmp_path: Path) -> None:
+    prompts: list[tuple[str, str]] = []
+    responses = iter(
+        [
+            time_allocation_popup.PopupResponse(
+                time_allocation_popup.REVIEW_ACTION,
+                "brunch,1",
+            ),
+            time_allocation_popup.PopupResponse(
+                time_allocation_popup.LOG_ACTION,
+                "brunch,1",
+            ),
+        ]
+    )
+
+    def fake_ask_with_yad(
+        message: str,
+        entry_text: str = "",
+    ) -> time_allocation_popup.PopupResponse:
+        prompts.append((message, entry_text))
+        return next(responses)
+
+    monkeypatch.setattr(time_allocation_popup, "ask_with_yad", fake_ask_with_yad)
+
+    status = time_allocation_popup.run(tmp_path, at(11))
+
+    assert status == 0
+    assert len(prompts) == 2
+    assert prompts[0][1] == ""
+    assert prompts[1][1] == "brunch,1"
+    assert "Would append:" in prompts[1][0]
+    assert "2026-07-02 10:30-11:00  0.50h  brunch" in prompts[1][0]
+    log_path = tmp_path / "time-allocation" / "time-allocation.txt"
+    assert log_path.read_text(encoding="utf-8") == "2026-07-02 10:30-11:00  0.50h  brunch\n"
+
+
+def test_review_does_not_write_if_user_cancels(monkeypatch, tmp_path: Path) -> None:
+    responses = iter(
+        [
+            time_allocation_popup.PopupResponse(
+                time_allocation_popup.REVIEW_ACTION,
+                "brunch,1",
+            ),
+            None,
+        ]
+    )
+
+    def fake_ask_with_yad(
+        message: str,
+        entry_text: str = "",
+    ) -> time_allocation_popup.PopupResponse | None:
+        return next(responses)
+
+    monkeypatch.setattr(time_allocation_popup, "ask_with_yad", fake_ask_with_yad)
+
+    status = time_allocation_popup.run(tmp_path, at(11))
+
+    assert status == 0
+    assert not (tmp_path / "time-allocation" / "time-allocation.txt").exists()
