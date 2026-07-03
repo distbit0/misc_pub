@@ -116,6 +116,57 @@ def test_fractional_duration_can_start_with_decimal_point() -> None:
     ]
 
 
+def test_end_time_with_decimal_clock_derives_duration() -> None:
+    segments = time_allocation_popup.parse_activity_segments("sleep,9.5am", at(8), at(10))
+
+    assert segment_tuples(segments) == [("sleep", "08:00", "09:30")]
+
+
+def test_end_time_with_colon_clock_derives_duration() -> None:
+    segments = time_allocation_popup.parse_activity_segments("sleep,9:30am", at(8), at(10))
+
+    assert segment_tuples(segments) == [("sleep", "08:00", "09:30")]
+
+
+def test_end_time_can_cross_midnight() -> None:
+    start = datetime(2026, 7, 2, 23, 30, tzinfo=LOCAL_TZ)
+    end = datetime(2026, 7, 3, 10, 0, tzinfo=LOCAL_TZ)
+
+    segments = time_allocation_popup.parse_activity_segments("sleep,9.5am", start, end)
+
+    assert segments[0].start == start
+    assert segments[0].end == datetime(2026, 7, 3, 9, 30, tzinfo=LOCAL_TZ)
+
+
+def test_bare_decimal_still_means_duration() -> None:
+    segments = time_allocation_popup.parse_activity_segments("sleep,9.5", at(8), at(20))
+
+    assert segment_tuples(segments) == [("sleep", "08:00", "17:30")]
+
+
+def test_end_time_after_period_is_rejected() -> None:
+    with pytest.raises(ValueError, match="after the unaccounted period"):
+        time_allocation_popup.parse_activity_segments("sleep,10am", at(8), at(9))
+
+
+def test_mixed_duration_and_end_time_input() -> None:
+    start = datetime(2026, 7, 2, 22, 0, tzinfo=LOCAL_TZ)
+    end = datetime(2026, 7, 3, 10, 30, tzinfo=LOCAL_TZ)
+
+    segments = time_allocation_popup.parse_activity_segments(
+        "work,1.5,go to bed,0.5,sleep,9.5am,get ready,0.5",
+        start,
+        end,
+    )
+
+    assert segment_tuples(segments) == [
+        ("work", "22:00", "23:30"),
+        ("go to bed", "23:30", "00:00"),
+        ("sleep", "00:00", "09:30"),
+        ("get ready", "09:30", "10:00"),
+    ]
+
+
 def test_dot_repeats_last_activity() -> None:
     segments = time_allocation_popup.parse_activity_segments(
         ".,3,relax",

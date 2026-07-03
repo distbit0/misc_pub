@@ -8,6 +8,7 @@ from datetime import datetime, time, timedelta
 import html
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -35,6 +36,7 @@ class ActivitySegment:
 class ActivityRequest:
     activity: str
     hours: float | None
+    end_time: time | None
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,44 @@ def parse_hours(value: str) -> float:
     if hours <= 0:
         raise ValueError(f"Duration must be positive, got: {value!r}")
     return hours
+
+
+def parse_clock_end_time(value: str) -> time | None:
+    stripped = re.sub(r"\s+", "", value).casefold()
+    match = re.fullmatch(r"(\d{1,2})(?:(:|\.)(\d{1,2}))?(am|pm)", stripped)
+    if match is None:
+        return None
+
+    hour = int(match.group(1))
+    separator = match.group(2)
+    minute_text = match.group(3)
+    suffix = match.group(4)
+    if not 1 <= hour <= 12:
+        raise ValueError(f"Clock time hour must be 1-12, got: {value!r}")
+
+    if minute_text is None:
+        minute = 0
+    elif separator == ":":
+        minute = int(minute_text)
+    else:
+        fraction = float(f"0.{minute_text}")
+        minute = round(fraction * 60)
+
+    if not 0 <= minute < 60:
+        raise ValueError(f"Clock time minute must be 0-59, got: {value!r}")
+
+    if suffix == "am":
+        hour = 0 if hour == 12 else hour
+    else:
+        hour = 12 if hour == 12 else hour + 12
+    return time(hour, minute)
+
+
+def parse_request_value(value: str) -> tuple[float | None, time | None]:
+    clock_end_time = parse_clock_end_time(value)
+    if clock_end_time is not None:
+        return None, clock_end_time
+    return parse_hours(value), None
 
 
 def csv_tokens(raw_input: str) -> list[str]:
@@ -111,12 +151,20 @@ def parse_activity_requests(
         token_index += 1
 
         hours = None
+        end_time = None
         if token_index < len(tokens):
-            hours = parse_hours(tokens[token_index])
+            hours, end_time = parse_request_value(tokens[token_index])
             token_index += 1
-        requests.append(ActivityRequest(activity=activity, hours=hours))
+        requests.append(ActivityRequest(activity=activity, hours=hours, end_time=end_time))
 
     return requests
+
+
+def resolve_end_time(cursor: datetime, end_time: time) -> datetime:
+    candidate = datetime.combine(cursor.date(), end_time, tzinfo=cursor.tzinfo)
+    if candidate <= cursor:
+        candidate += timedelta(days=1)
+    return candidate
 
 
 def segment_requests(
@@ -130,7 +178,10 @@ def segment_requests(
         raise ValueError("Input cannot be empty.")
 
     period_hours = (period_end - period_start).total_seconds() / 3600
-    all_hours_specified = all(request.hours is not None for request in requests)
+    all_hours_specified = all(
+        request.hours is not None and request.end_time is None
+        for request in requests
+    )
     scale = 1.0
     if all_hours_specified:
         requested_hours = sum(request.hours or 0 for request in requests)
@@ -144,7 +195,13 @@ def segment_requests(
         if cursor >= period_end:
             break
 
-        if request.hours is None:
+        if request.end_time is not None:
+            segment_end = resolve_end_time(cursor, request.end_time)
+            if segment_end > period_end:
+                raise ValueError(
+                    f"End time for {request.activity!r} is after the unaccounted period."
+                )
+        elif request.hours is None:
             segment_end = period_end
         else:
             requested_end = cursor + timedelta(hours=request.hours * scale)
@@ -470,8 +527,8 @@ def popup_text(
         else ""
     )
     help_text = html.escape(
-        "CSV: activity | activity,hours | activity,hours,next activity | . repeats last activity\n"
-        "Examples: brunch | brunch, 2 | brunch, .2, work | ., 3, relax\n"
+        "CSV: activity | activity,hours | activity,end time | . repeats last activity\n"
+        "Examples: brunch | brunch, 2 | sleep, 9.5am | ., 3, relax\n"
         "Auto-closes after 4 minutes."
     )
     return (
