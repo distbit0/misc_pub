@@ -164,8 +164,14 @@ def test_daily_log_splits_segments_at_midnight(tmp_path: Path) -> None:
 
     time_allocation_popup.append_segments(tmp_path, [segment])
 
-    assert (tmp_path / "2026-07-02.txt").read_text(encoding="utf-8") == "23:30-00:00  0.50h  work\n"
-    assert (tmp_path / "2026-07-03.txt").read_text(encoding="utf-8") == "00:00-00:30  0.50h  work\n"
+    assert (
+        tmp_path / "time-allocation.txt"
+    ).read_text(encoding="utf-8") == (
+        "2026-07-02 23:30-00:00  0.50h  work\n"
+        "2026-07-03 00:00-00:30  0.50h  work\n"
+    )
+    assert not (tmp_path / "2026-07-02.txt").exists()
+    assert not (tmp_path / "2026-07-03.txt").exists()
 
 
 def test_save_state_continues_previous_run_case_and_space_insensitive(tmp_path: Path) -> None:
@@ -214,6 +220,29 @@ def test_save_state_intervening_activity_resets_matching_previous_run(tmp_path: 
 
 
 def test_load_state_backfills_legacy_run_start_from_logs(tmp_path: Path) -> None:
+    (tmp_path / "2026-07-02.txt").write_text(
+        "17:00-17:30  0.50h  work\n"
+        "17:30-19:00  1.50h  Clean room\n"
+        "19:00-20:20  1.33h  cleanroom\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "state.json").write_text(
+        json.dumps(
+            {
+                "cursor_time": at(20, 20).isoformat(),
+                "last_activity": "Clean room",
+                "last_activity_end": at(20, 20).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = time_allocation_popup.load_state(tmp_path, at(21))
+
+    assert state["last_activity_run_start"] == at(17, 30).isoformat()
+
+
+def test_load_state_backfills_run_start_from_single_log_file(tmp_path: Path) -> None:
     time_allocation_popup.append_segments(
         tmp_path,
         [
@@ -255,5 +284,5 @@ def test_invalid_input_reopens_prompt_with_previous_text(monkeypatch, tmp_path: 
     assert prompts[0][1] == ""
     assert prompts[1][1] == "brunch,work"
     assert "Error:" in prompts[1][0]
-    log_path = tmp_path / "time-allocation" / "2026-07-02.txt"
-    assert log_path.read_text(encoding="utf-8") == "10:30-11:00  0.50h  brunch\n"
+    log_path = tmp_path / "time-allocation" / "time-allocation.txt"
+    assert log_path.read_text(encoding="utf-8") == "2026-07-02 10:30-11:00  0.50h  brunch\n"

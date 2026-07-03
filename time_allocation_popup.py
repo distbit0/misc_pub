@@ -16,6 +16,7 @@ POPUP_TIMEOUT_SECONDS = 4 * 60
 POPUP_FONT = "Sans 18"
 NOTES_DIR = Path.home() / "notes"
 LOG_DIR_NAME = "time-allocation"
+LOG_FILE_NAME = "time-allocation.txt"
 STATE_FILE_NAME = "state.json"
 
 
@@ -215,22 +216,49 @@ def parse_log_segment(log_path: Path, line: str, tzinfo) -> LoggedActivity:
     return LoggedActivity(activity=activity, start=start, end=end)
 
 
+def parse_single_file_log_segment(line: str, tzinfo) -> LoggedActivity:
+    date_text, time_range, _hours_text, activity = line.rstrip("\n").split(None, 3)
+    start_text, end_text = time_range.split("-", 1)
+    log_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+    start_time = datetime.strptime(start_text, "%H:%M").time()
+    end_time = datetime.strptime(end_text, "%H:%M").time()
+    start = datetime.combine(log_date, start_time, tzinfo=tzinfo)
+    end = datetime.combine(log_date, end_time, tzinfo=tzinfo)
+    if end <= start:
+        end += timedelta(days=1)
+    return LoggedActivity(activity=activity, start=start, end=end)
+
+
+def read_logged_activity_file(log_path: Path, tzinfo) -> list[LoggedActivity]:
+    logged_activities: list[LoggedActivity] = []
+    for line_number, line in enumerate(
+        log_path.read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        try:
+            if log_path.name == LOG_FILE_NAME:
+                logged_activities.append(parse_single_file_log_segment(line, tzinfo))
+            else:
+                logged_activities.append(parse_log_segment(log_path, line, tzinfo))
+        except ValueError as error:
+            print(
+                f"Warning: skipping malformed log line {log_path}:{line_number}: {error}",
+                file=sys.stderr,
+            )
+    return logged_activities
+
+
 def read_logged_activities(log_dir: Path, tzinfo) -> list[LoggedActivity]:
     logged_activities: list[LoggedActivity] = []
+    single_log_path = log_dir / LOG_FILE_NAME
+    if single_log_path.exists():
+        logged_activities.extend(read_logged_activity_file(single_log_path, tzinfo))
     for log_path in sorted(log_dir.glob("*.txt")):
-        for line_number, line in enumerate(
-            log_path.read_text(encoding="utf-8").splitlines(),
-            start=1,
-        ):
-            if not line.strip():
-                continue
-            try:
-                logged_activities.append(parse_log_segment(log_path, line, tzinfo))
-            except ValueError as error:
-                print(
-                    f"Warning: skipping malformed log line {log_path}:{line_number}: {error}",
-                    file=sys.stderr,
-                )
+        if log_path.name == LOG_FILE_NAME:
+            continue
+        logged_activities.extend(read_logged_activity_file(log_path, tzinfo))
     return sorted(logged_activities, key=lambda activity: activity.start)
 
 
@@ -373,16 +401,17 @@ def split_segment_by_day(segment: ActivitySegment) -> list[ActivitySegment]:
 
 def log_line(segment: ActivitySegment) -> str:
     return (
+        f"{segment.start.date().isoformat()} "
         f"{segment.start.strftime('%H:%M')}-{segment.end.strftime('%H:%M')}"
         f"  {segment.hours:.2f}h  {segment.activity}"
     )
 
 
 def append_segments(log_dir: Path, segments: list[ActivitySegment]) -> None:
-    for segment in segments:
-        for day_segment in split_segment_by_day(segment):
-            log_path = log_dir / f"{day_segment.start.date().isoformat()}.txt"
-            with log_path.open("a", encoding="utf-8") as log_file:
+    log_path = log_dir / LOG_FILE_NAME
+    with log_path.open("a", encoding="utf-8") as log_file:
+        for segment in segments:
+            for day_segment in split_segment_by_day(segment):
                 log_file.write(log_line(day_segment) + "\n")
 
 
