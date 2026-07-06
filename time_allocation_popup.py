@@ -17,7 +17,7 @@ import sys
 DEFAULT_LOOKBACK = timedelta(minutes=30)
 POPUP_TIMEOUT_SECONDS = 4 * 60
 POPUP_FONT = "Sans 18"
-STATUS_FONT = "Sans 28"
+STATUS_FONT = POPUP_FONT
 NOTES_DIR = Path.home() / "notes"
 LOG_DIR_NAME = "time-allocation"
 LOG_FILE_NAME = "time-allocation.txt"
