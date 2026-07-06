@@ -966,7 +966,7 @@ def popup_text(
         )
         duration_line = f"{format_display_hours(parsed_last_activity_end - run_start)} len"
 
-    status_lines = ["last:", last_activity]
+    status_lines = ["last:", last_activity, ""]
     if duration_line is not None:
         status_lines.append(duration_line)
     status_lines.extend(
