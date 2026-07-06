@@ -17,6 +17,7 @@ import sys
 DEFAULT_LOOKBACK = timedelta(minutes=30)
 POPUP_TIMEOUT_SECONDS = 4 * 60
 POPUP_FONT = "Sans 18"
+STATUS_FONT = "Sans 28"
 NOTES_DIR = Path.home() / "notes"
 LOG_DIR_NAME = "time-allocation"
 LOG_FILE_NAME = "time-allocation.txt"
@@ -32,6 +33,7 @@ PENDING_EXTEND = "pending_extend"
 INSERTED = "inserted"
 LOG_ACTION = "log"
 REVIEW_ACTION = "review"
+HELP_ACTION = "help"
 
 
 @dataclass(frozen=True)
@@ -937,6 +939,7 @@ def popup_text(
     now: datetime,
     error_message: str | None = None,
     review_text: str | None = None,
+    show_help: bool = True,
 ) -> str:
     last_activity = str(state.get("last_activity") or "none")
     last_activity_end = state.get("last_activity_end")
@@ -951,6 +954,7 @@ def popup_text(
         last_activity_end_text = "none"
 
     last_activity_run_start = state.get("last_activity_run_start")
+    duration_line = None
     if (
         parsed_last_activity_end is not None
         and isinstance(last_activity_run_start, str)
@@ -960,14 +964,18 @@ def popup_text(
             last_activity_run_start,
             "last_activity_run_start",
         )
-        duration_text = f" ({format_display_hours(parsed_last_activity_end - run_start)})"
-    else:
-        duration_text = ""
+        duration_line = f"{format_display_hours(parsed_last_activity_end - run_start)} len"
 
-    status_line = html.escape(
-        f"Last: {last_activity}{duration_text} @ {last_activity_end_text} "
-        f"({format_display_hours(now - period_start)} ago)"
+    status_lines = ["last:", last_activity]
+    if duration_line is not None:
+        status_lines.append(duration_line)
+    status_lines.extend(
+        [
+            f"{last_activity_end_text} end",
+            f"{format_display_hours(now - period_start)} ago",
+        ]
     )
+    status_text = html.escape("\n".join(status_lines))
     error_block = (
         f'<span foreground="red"><b>Error:</b> {html.escape(error_message)}</span>\n\n'
         if error_message
@@ -984,13 +992,18 @@ def popup_text(
         "Examples: brunch | brunch, 2 | sleep, 9.5am | ., 3, relax\n"
         "Auto-closes after 4 minutes."
     )
+    help_block = f'\n\n<span font_desc="{POPUP_FONT}">{help_text}</span>' if show_help else ""
     return (
-        f'{error_block}<span font_desc="{POPUP_FONT}"><b>{status_line}</b></span>'
-        f'\n\n<span font_desc="{POPUP_FONT}">{help_text}</span>{review_block}'
+        f'{error_block}<span font_desc="{STATUS_FONT}"><b>{status_text}</b></span>'
+        f"{help_block}{review_block}"
     )
 
 
-def ask_with_yad(message: str, entry_text: str = "") -> PopupResponse | None:
+def ask_with_yad(
+    message: str,
+    entry_text: str = "",
+    show_help_button: bool = False,
+) -> PopupResponse | None:
     command = [
         "yad",
         "--entry",
@@ -1004,18 +1017,25 @@ def ask_with_yad(message: str, entry_text: str = "") -> PopupResponse | None:
         f"--timeout={POPUP_TIMEOUT_SECONDS}",
         "--timeout-indicator=bottom",
         "--button=Cancel:1",
-        "--button=Review:2",
-        "--button=Log:0",
     ]
+    if show_help_button:
+        command.append("--button=Help:3")
+    command.extend(["--button=Review:2", "--button=Log:0"])
     completed = subprocess.run(command, text=True, capture_output=True, check=False)
     if completed.returncode == 0:
         return PopupResponse(action=LOG_ACTION, text=completed.stdout.strip())
     if completed.returncode == 2:
         return PopupResponse(action=REVIEW_ACTION, text=completed.stdout.strip())
+    if completed.returncode == 3:
+        return PopupResponse(action=HELP_ACTION, text=completed.stdout.strip())
     return None
 
 
-def run(notes_dir: Path, now: datetime) -> int:
+def run(
+    notes_dir: Path,
+    now: datetime,
+    hide_help_by_default: bool = False,
+) -> int:
     log_dir = notes_dir / LOG_DIR_NAME
     log_dir.mkdir(parents=True, exist_ok=True)
     state = load_state(log_dir, now)
@@ -1027,15 +1047,29 @@ def run(notes_dir: Path, now: datetime) -> int:
     entry_text = ""
     error_message = None
     review_text = None
+    help_visible = not hide_help_by_default
     while True:
         response = ask_with_yad(
-            popup_text(state, period_start, now, error_message, review_text),
+            popup_text(
+                state,
+                period_start,
+                now,
+                error_message,
+                review_text,
+                show_help=help_visible,
+            ),
             entry_text,
+            show_help_button=hide_help_by_default and not help_visible,
         )
-        if response is None or not response.text.strip():
+        if response is None:
             return 0
         raw_input = response.text
         entry_text = raw_input
+        if response.action == HELP_ACTION:
+            help_visible = True
+            continue
+        if not raw_input.strip():
+            return 0
         last_activity = state.get("last_activity")
         try:
             segments = parse_activity_segments(
@@ -1075,6 +1109,7 @@ def main() -> None:
     parser.add_argument("--setup-google-calendar", action="store_true")
     parser.add_argument("--sync-google-calendar", action="store_true")
     parser.add_argument("--google-credentials", type=Path)
+    parser.add_argument("--hide-help-by-default", action="store_true")
     args = parser.parse_args()
 
     if args.setup_google_calendar:
@@ -1089,7 +1124,7 @@ def main() -> None:
         print(f"Synced queued events: {synced_count}")
         raise SystemExit(0)
 
-    raise SystemExit(run(args.notes_dir, local_now()))
+    raise SystemExit(run(args.notes_dir, local_now(), args.hide_help_by_default))
 
 
 if __name__ == "__main__":

@@ -136,11 +136,35 @@ def test_popup_header_uses_compact_record_fields() -> None:
         at(22),
     )
 
-    assert "Last: Clean room (2.5h) @ 8:20pm (1.7h ago)" in text
+    assert "last:\nClean room\n2.5h len\n8:20pm end\n1.7h ago" in text
+    assert 'font_desc="Sans 28"' in text
+    assert "CSV: activity" in text
+    assert "Last:" not in text
     assert "Last record:" not in text
     assert "Last record end:" not in text
     assert "Time since:" not in text
     assert "What have you done since" not in text
+
+
+def test_popup_can_hide_help_without_changing_status_font() -> None:
+    text = time_allocation_popup.popup_text(
+        {
+            "last_activity": "figure out what to do next for truesight",
+            "last_activity_end": at(21, 40).isoformat(),
+            "last_activity_run_start": at(21).isoformat(),
+        },
+        at(21, 40),
+        at(21, 46),
+        show_help=False,
+    )
+
+    assert (
+        "last:\nfigure out what to do next for truesight\n"
+        "0.7h len\n9:40pm end\n0.1h ago"
+    ) in text
+    assert 'font_desc="Sans 28"' in text
+    assert "CSV: activity" not in text
+    assert "Examples:" not in text
 
 
 def test_activity_with_duration_leaves_remainder_unaccounted() -> None:
@@ -521,6 +545,7 @@ def test_invalid_input_reopens_prompt_with_previous_text(monkeypatch, tmp_path: 
     def fake_ask_with_yad(
         message: str,
         entry_text: str = "",
+        show_help_button: bool = False,
     ) -> time_allocation_popup.PopupResponse:
         prompts.append((message, entry_text))
         return next(responses)
@@ -559,6 +584,7 @@ def test_review_reopens_prompt_with_preview_and_preserved_text(monkeypatch, tmp_
     def fake_ask_with_yad(
         message: str,
         entry_text: str = "",
+        show_help_button: bool = False,
     ) -> time_allocation_popup.PopupResponse:
         prompts.append((message, entry_text))
         return next(responses)
@@ -577,6 +603,46 @@ def test_review_reopens_prompt_with_preview_and_preserved_text(monkeypatch, tmp_
     assert log_path.read_text(encoding="utf-8") == "2026-07-02 10:30-11:00  0.50h  brunch\n"
 
 
+def test_hidden_help_button_reopens_prompt_with_help(monkeypatch, tmp_path: Path) -> None:
+    prompts: list[tuple[str, str, bool]] = []
+    responses = iter(
+        [
+            time_allocation_popup.PopupResponse(
+                time_allocation_popup.HELP_ACTION,
+                "brunch,1",
+            ),
+            time_allocation_popup.PopupResponse(
+                time_allocation_popup.LOG_ACTION,
+                "brunch,1",
+            ),
+        ]
+    )
+
+    def fake_ask_with_yad(
+        message: str,
+        entry_text: str = "",
+        show_help_button: bool = False,
+    ) -> time_allocation_popup.PopupResponse:
+        prompts.append((message, entry_text, show_help_button))
+        return next(responses)
+
+    monkeypatch.setattr(time_allocation_popup, "ask_with_yad", fake_ask_with_yad)
+
+    status = time_allocation_popup.run(
+        tmp_path,
+        at(11),
+        hide_help_by_default=True,
+    )
+
+    assert status == 0
+    assert len(prompts) == 2
+    assert "CSV: activity" not in prompts[0][0]
+    assert prompts[0][2] is True
+    assert prompts[1][1] == "brunch,1"
+    assert "CSV: activity" in prompts[1][0]
+    assert prompts[1][2] is False
+
+
 def test_review_does_not_write_if_user_cancels(monkeypatch, tmp_path: Path) -> None:
     responses = iter(
         [
@@ -591,6 +657,7 @@ def test_review_does_not_write_if_user_cancels(monkeypatch, tmp_path: Path) -> N
     def fake_ask_with_yad(
         message: str,
         entry_text: str = "",
+        show_help_button: bool = False,
     ) -> time_allocation_popup.PopupResponse | None:
         return next(responses)
 
