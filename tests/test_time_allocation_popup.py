@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sys
 
 import pytest
@@ -39,6 +40,83 @@ def segment_tuples(segments):
 
 def read_state(log_dir: Path) -> dict:
     return json.loads((log_dir / "state.json").read_text(encoding="utf-8"))
+
+
+def read_outbox(log_dir: Path) -> dict:
+    return json.loads(
+        (log_dir / "google-event-outbox.json").read_text(encoding="utf-8")
+    )
+
+
+def write_calendar_state(log_dir: Path) -> None:
+    (log_dir / "google-calendar-state.json").write_text(
+        json.dumps({"calendar_id": "calendar-1"}),
+        encoding="utf-8",
+    )
+
+
+class FakeGoogleError(Exception):
+    def __init__(self, status: int) -> None:
+        self.resp = type("Response", (), {"status": status})()
+
+
+class FakeExecute:
+    def __init__(self, callback) -> None:
+        self.callback = callback
+
+    def execute(self):
+        return self.callback()
+
+
+class FakeEventsResource:
+    def __init__(self, service) -> None:
+        self.service = service
+
+    def insert(self, calendarId: str, body: dict):
+        self.service.inserts.append((calendarId, body))
+        action = self.service.insert_actions.pop(0) if self.service.insert_actions else None
+
+        def execute():
+            if isinstance(action, Exception):
+                raise action
+            return {"id": body["id"]}
+
+        return FakeExecute(execute)
+
+    def patch(self, calendarId: str, eventId: str, body: dict):
+        self.service.patches.append((calendarId, eventId, body))
+        action = self.service.patch_actions.pop(0) if self.service.patch_actions else None
+
+        def execute():
+            if isinstance(action, Exception):
+                raise action
+            return {"id": eventId}
+
+        return FakeExecute(execute)
+
+
+class FakeCalendarsResource:
+    def __init__(self, service) -> None:
+        self.service = service
+
+    def insert(self, body: dict):
+        self.service.calendar_inserts.append(body)
+        return FakeExecute(lambda: {"id": "calendar-1", "summary": body["summary"]})
+
+
+class FakeGoogleService:
+    def __init__(self) -> None:
+        self.inserts: list[tuple[str, dict]] = []
+        self.patches: list[tuple[str, str, dict]] = []
+        self.calendar_inserts: list[dict] = []
+        self.insert_actions: list[Exception | None] = []
+        self.patch_actions: list[Exception | None] = []
+
+    def events(self) -> FakeEventsResource:
+        return FakeEventsResource(self)
+
+    def calendars(self) -> FakeCalendarsResource:
+        return FakeCalendarsResource(self)
 
 
 def test_activity_without_duration_fills_whole_period() -> None:
@@ -225,6 +303,113 @@ def test_daily_log_splits_segments_at_midnight(tmp_path: Path) -> None:
     assert not (tmp_path / "2026-07-03.txt").exists()
 
 
+def test_calendar_drafts_merge_repeats_case_and_space_insensitive() -> None:
+    drafts = time_allocation_popup.merge_calendar_event_drafts(
+        [
+            time_allocation_popup.ActivitySegment("Clean room", at(10), at(11)),
+            time_allocation_popup.ActivitySegment("cleanroom", at(11), at(12)),
+            time_allocation_popup.ActivitySegment("relax", at(12), at(13)),
+        ]
+    )
+
+    assert [(draft.activity, draft.start, draft.end) for draft in drafts] == [
+        ("Clean room", at(10), at(12)),
+        ("relax", at(12), at(13)),
+    ]
+
+
+def test_google_event_id_uses_allowed_calendar_characters() -> None:
+    event_id = time_allocation_popup.google_event_id_for("cleanroom", at(10), at(11))
+
+    assert len(event_id) >= 5
+    assert re.fullmatch(r"[a-v0-9]+", event_id)
+
+
+def test_calendar_queue_has_no_gaps_between_merged_events(tmp_path: Path) -> None:
+    segments = [
+        time_allocation_popup.ActivitySegment("work", at(10), at(11)),
+        time_allocation_popup.ActivitySegment("WORK", at(11), at(12)),
+        time_allocation_popup.ActivitySegment("relax", at(12), at(13)),
+    ]
+
+    time_allocation_popup.queue_google_calendar_events(tmp_path, segments)
+
+    events = read_outbox(tmp_path)["events"]
+    assert len(events) == 2
+    assert events[0]["start"] == at(10).isoformat()
+    assert events[0]["end"] == events[1]["start"]
+    assert events[1]["end"] == at(13).isoformat()
+
+
+def test_google_sync_retries_queued_insert_after_failure(tmp_path: Path) -> None:
+    write_calendar_state(tmp_path)
+    segment = time_allocation_popup.ActivitySegment("work", at(10), at(11))
+    time_allocation_popup.queue_google_calendar_events(tmp_path, [segment])
+    failing_service = FakeGoogleService()
+    failing_service.insert_actions.append(FakeGoogleError(500))
+
+    with pytest.raises(FakeGoogleError):
+        time_allocation_popup.sync_google_calendar_events(tmp_path, service=failing_service)
+
+    assert read_outbox(tmp_path)["events"][0]["status"] == time_allocation_popup.PENDING_INSERT
+
+    working_service = FakeGoogleService()
+    synced_count = time_allocation_popup.sync_google_calendar_events(
+        tmp_path,
+        service=working_service,
+    )
+
+    outbox_event = read_outbox(tmp_path)["events"][0]
+    assert synced_count == 1
+    assert outbox_event["status"] == time_allocation_popup.INSERTED
+    assert outbox_event["synced_end"] == at(11).isoformat()
+
+
+def test_google_insert_conflict_is_treated_as_already_inserted(tmp_path: Path) -> None:
+    write_calendar_state(tmp_path)
+    segment = time_allocation_popup.ActivitySegment("work", at(10), at(11))
+    time_allocation_popup.queue_google_calendar_events(tmp_path, [segment])
+    service = FakeGoogleService()
+    service.insert_actions.append(FakeGoogleError(409))
+
+    synced_count = time_allocation_popup.sync_google_calendar_events(
+        tmp_path,
+        service=service,
+    )
+
+    outbox_event = read_outbox(tmp_path)["events"][0]
+    assert synced_count == 1
+    assert outbox_event["status"] == time_allocation_popup.INSERTED
+
+
+def test_latest_google_event_is_extended_for_contiguous_repeat(tmp_path: Path) -> None:
+    write_calendar_state(tmp_path)
+    first_segment = time_allocation_popup.ActivitySegment("work", at(10), at(11))
+    time_allocation_popup.queue_google_calendar_events(tmp_path, [first_segment])
+    insert_service = FakeGoogleService()
+    time_allocation_popup.sync_google_calendar_events(tmp_path, service=insert_service)
+
+    second_segment = time_allocation_popup.ActivitySegment("WORK", at(11), at(12))
+    time_allocation_popup.queue_google_calendar_events(tmp_path, [second_segment])
+
+    queued_event = read_outbox(tmp_path)["events"][0]
+    assert len(read_outbox(tmp_path)["events"]) == 1
+    assert queued_event["status"] == time_allocation_popup.PENDING_EXTEND
+    assert queued_event["end"] == at(12).isoformat()
+
+    patch_service = FakeGoogleService()
+    synced_count = time_allocation_popup.sync_google_calendar_events(
+        tmp_path,
+        service=patch_service,
+    )
+
+    assert synced_count == 1
+    assert len(patch_service.inserts) == 0
+    assert len(patch_service.patches) == 1
+    assert patch_service.patches[0][2]["end"]["dateTime"] == at(12).isoformat()
+    assert read_outbox(tmp_path)["events"][0]["status"] == time_allocation_popup.INSERTED
+
+
 def test_save_state_continues_previous_run_case_and_space_insensitive(tmp_path: Path) -> None:
     previous_state = {
         "last_activity": "Clean room",
@@ -351,6 +536,9 @@ def test_invalid_input_reopens_prompt_with_previous_text(monkeypatch, tmp_path: 
     assert "Error:" in prompts[1][0]
     log_path = tmp_path / "time-allocation" / "time-allocation.txt"
     assert log_path.read_text(encoding="utf-8") == "2026-07-02 10:30-11:00  0.50h  brunch\n"
+    outbox_event = read_outbox(tmp_path / "time-allocation")["events"][0]
+    assert outbox_event["activity"] == "brunch"
+    assert outbox_event["status"] == time_allocation_popup.PENDING_INSERT
 
 
 def test_review_reopens_prompt_with_preview_and_preserved_text(monkeypatch, tmp_path: Path) -> None:
@@ -412,3 +600,4 @@ def test_review_does_not_write_if_user_cancels(monkeypatch, tmp_path: Path) -> N
 
     assert status == 0
     assert not (tmp_path / "time-allocation" / "time-allocation.txt").exists()
+    assert not (tmp_path / "time-allocation" / "google-event-outbox.json").exists()

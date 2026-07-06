@@ -5,8 +5,10 @@ import argparse
 import csv
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
+import hashlib
 import html
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -19,6 +21,15 @@ NOTES_DIR = Path.home() / "notes"
 LOG_DIR_NAME = "time-allocation"
 LOG_FILE_NAME = "time-allocation.txt"
 STATE_FILE_NAME = "state.json"
+GOOGLE_CALENDAR_STATE_FILE_NAME = "google-calendar-state.json"
+GOOGLE_EVENT_OUTBOX_FILE_NAME = "google-event-outbox.json"
+GOOGLE_TOKEN_FILE_NAME = "google-token.json"
+GOOGLE_CALENDAR_NAME = "Time Allocation"
+GOOGLE_CALENDAR_TIME_ZONE = "Asia/Ho_Chi_Minh"
+GOOGLE_CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.app.created"]
+PENDING_INSERT = "pending_insert"
+PENDING_EXTEND = "pending_extend"
+INSERTED = "inserted"
 LOG_ACTION = "log"
 REVIEW_ACTION = "review"
 
@@ -54,8 +65,36 @@ class PopupResponse:
     text: str
 
 
+@dataclass(frozen=True)
+class CalendarEventDraft:
+    activity: str
+    activity_key: str
+    start: datetime
+    end: datetime
+
+
+class GoogleCalendarUnavailable(RuntimeError):
+    pass
+
+
 def local_now() -> datetime:
     return datetime.now().astimezone()
+
+
+def read_json_object(path: Path, default: dict[str, object]) -> dict[str, object]:
+    if not path.exists():
+        return dict(default)
+    with path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    if not isinstance(data, dict):
+        raise ValueError(f"JSON file must contain an object: {path}")
+    return data
+
+
+def write_json_object(path: Path, data: dict[str, object], private: bool = False) -> None:
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    if private:
+        os.chmod(path, 0o600)
 
 
 def parse_iso_datetime(value: object, field_name: str) -> datetime:
@@ -144,6 +183,23 @@ def normalize_activity_name(activity: str, last_activity: str | None) -> str:
 
 def activity_key(activity: str) -> str:
     return "".join(activity.split()).casefold()
+
+
+def google_event_id_for(activity_key_value: str, start: datetime, end: datetime) -> str:
+    event_fingerprint = "|".join(
+        [
+            activity_key_value,
+            start.isoformat(),
+            end.isoformat(),
+        ]
+    )
+    return f"ta{hashlib.sha256(event_fingerprint.encode('utf-8')).hexdigest()[:40]}"
+
+
+def google_error_status(error: Exception) -> int | None:
+    response = getattr(error, "resp", None)
+    status = getattr(response, "status", None)
+    return status if isinstance(status, int) else None
 
 
 def parse_activity_requests(
@@ -484,6 +540,378 @@ def segments_log_text(segments: list[ActivitySegment]) -> str:
     return "".join(f"{line}\n" for line in segment_log_lines(segments))
 
 
+def merge_calendar_event_drafts(segments: list[ActivitySegment]) -> list[CalendarEventDraft]:
+    drafts: list[CalendarEventDraft] = []
+    for segment in segments:
+        key = activity_key(segment.activity)
+        if drafts and drafts[-1].activity_key == key and drafts[-1].end == segment.start:
+            previous = drafts[-1]
+            drafts[-1] = CalendarEventDraft(
+                activity=previous.activity,
+                activity_key=previous.activity_key,
+                start=previous.start,
+                end=segment.end,
+            )
+            continue
+        drafts.append(
+            CalendarEventDraft(
+                activity=segment.activity,
+                activity_key=key,
+                start=segment.start,
+                end=segment.end,
+            )
+        )
+    return drafts
+
+
+def google_calendar_state_path(log_dir: Path) -> Path:
+    return log_dir / GOOGLE_CALENDAR_STATE_FILE_NAME
+
+
+def google_event_outbox_path(log_dir: Path) -> Path:
+    return log_dir / GOOGLE_EVENT_OUTBOX_FILE_NAME
+
+
+def google_token_path(log_dir: Path) -> Path:
+    return log_dir / GOOGLE_TOKEN_FILE_NAME
+
+
+def load_google_calendar_state(log_dir: Path) -> dict[str, object]:
+    return read_json_object(google_calendar_state_path(log_dir), {})
+
+
+def save_google_calendar_state(log_dir: Path, state: dict[str, object]) -> None:
+    write_json_object(google_calendar_state_path(log_dir), state)
+
+
+def load_google_event_outbox(log_dir: Path) -> dict[str, object]:
+    outbox = read_json_object(
+        google_event_outbox_path(log_dir),
+        {"version": 1, "latest_event_id": "", "events": []},
+    )
+    events = outbox.get("events")
+    if not isinstance(events, list):
+        raise ValueError(f"Outbox events must be a list: {google_event_outbox_path(log_dir)}")
+    return outbox
+
+
+def save_google_event_outbox(log_dir: Path, outbox: dict[str, object]) -> None:
+    write_json_object(google_event_outbox_path(log_dir), outbox)
+
+
+def outbox_events(outbox: dict[str, object]) -> list[dict[str, object]]:
+    events = outbox.get("events")
+    if not isinstance(events, list):
+        raise ValueError("Outbox events must be a list.")
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError("Each outbox event must be an object.")
+    return events
+
+
+def calendar_event_record(draft: CalendarEventDraft) -> dict[str, object]:
+    return {
+        "id": google_event_id_for(draft.activity_key, draft.start, draft.end),
+        "activity": draft.activity,
+        "activity_key": draft.activity_key,
+        "start": draft.start.isoformat(),
+        "end": draft.end.isoformat(),
+        "synced_end": "",
+        "status": PENDING_INSERT,
+    }
+
+
+def find_event_record(
+    events: list[dict[str, object]],
+    event_id: object,
+) -> dict[str, object] | None:
+    if not isinstance(event_id, str) or not event_id:
+        return None
+    return next(
+        (event for event in events if event.get("id") == event_id),
+        None,
+    )
+
+
+def queue_google_calendar_events(log_dir: Path, segments: list[ActivitySegment]) -> None:
+    drafts = merge_calendar_event_drafts(segments)
+    if not drafts:
+        return
+
+    outbox = load_google_event_outbox(log_dir)
+    events = outbox_events(outbox)
+    latest_event = find_event_record(events, outbox.get("latest_event_id"))
+
+    if latest_event is not None:
+        latest_key = latest_event.get("activity_key")
+        latest_end = parse_iso_datetime(latest_event.get("end"), "outbox event end")
+        first_draft = drafts[0]
+        if latest_key == first_draft.activity_key and latest_end == first_draft.start:
+            latest_event["end"] = first_draft.end.isoformat()
+            if latest_event.get("status") == INSERTED:
+                latest_event["status"] = PENDING_EXTEND
+            outbox["latest_event_id"] = latest_event["id"]
+            drafts = drafts[1:]
+
+    for draft in drafts:
+        record = calendar_event_record(draft)
+        events.append(record)
+        outbox["latest_event_id"] = record["id"]
+
+    save_google_event_outbox(log_dir, outbox)
+
+
+def google_event_body(record: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": str(record["id"]),
+        "summary": str(record["activity"]),
+        "start": {
+            "dateTime": str(record["start"]),
+            "timeZone": GOOGLE_CALENDAR_TIME_ZONE,
+        },
+        "end": {
+            "dateTime": str(record["end"]),
+            "timeZone": GOOGLE_CALENDAR_TIME_ZONE,
+        },
+        "description": "Created by time_allocation_popup.py",
+    }
+
+
+def google_event_end_patch(record: dict[str, object]) -> dict[str, object]:
+    return {
+        "end": {
+            "dateTime": str(record["end"]),
+            "timeZone": GOOGLE_CALENDAR_TIME_ZONE,
+        }
+    }
+
+
+def save_google_credentials(token_path: Path, credentials) -> None:
+    token_path.write_text(credentials.to_json() + "\n", encoding="utf-8")
+    os.chmod(token_path, 0o600)
+
+
+def google_calendar_service(
+    log_dir: Path,
+    credentials_path: Path | None = None,
+    interactive: bool = False,
+):
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+
+    token_path = google_token_path(log_dir)
+    credentials = None
+    if token_path.exists():
+        credentials = Credentials.from_authorized_user_file(
+            str(token_path),
+            GOOGLE_CALENDAR_SCOPES,
+        )
+
+    if credentials and credentials.expired and credentials.refresh_token:
+        credentials.refresh(Request())
+        save_google_credentials(token_path, credentials)
+
+    if not credentials or not credentials.valid:
+        if not interactive or credentials_path is None:
+            raise GoogleCalendarUnavailable(
+                "Google Calendar is not configured. Run setup with "
+                "--setup-google-calendar --google-credentials /path/to/credentials.json."
+            )
+        flow = InstalledAppFlow.from_client_secrets_file(
+            str(credentials_path),
+            GOOGLE_CALENDAR_SCOPES,
+        )
+        credentials = flow.run_local_server(port=0)
+        save_google_credentials(token_path, credentials)
+
+    return build("calendar", "v3", credentials=credentials)
+
+
+def ensure_google_calendar(
+    log_dir: Path,
+    service,
+    calendar_name: str = GOOGLE_CALENDAR_NAME,
+) -> str:
+    state = load_google_calendar_state(log_dir)
+    calendar_id = state.get("calendar_id")
+    if isinstance(calendar_id, str) and calendar_id:
+        return calendar_id
+
+    calendar = (
+        service.calendars()
+        .insert(body={"summary": calendar_name, "timeZone": GOOGLE_CALENDAR_TIME_ZONE})
+        .execute()
+    )
+    calendar_id = calendar.get("id")
+    if not isinstance(calendar_id, str) or not calendar_id:
+        raise ValueError("Google Calendar creation response did not include an id.")
+
+    save_google_calendar_state(
+        log_dir,
+        {
+            "calendar_id": calendar_id,
+            "summary": calendar.get("summary", calendar_name),
+            "time_zone": GOOGLE_CALENDAR_TIME_ZONE,
+        },
+    )
+    return calendar_id
+
+
+def insert_google_event(service, calendar_id: str, record: dict[str, object]) -> bool:
+    try:
+        (
+            service.events()
+            .insert(calendarId=calendar_id, body=google_event_body(record))
+            .execute()
+        )
+        return True
+    except Exception as error:
+        if google_error_status(error) == 409:
+            return True
+        raise
+
+
+def extend_google_event(service, calendar_id: str, record: dict[str, object]) -> bool:
+    try:
+        (
+            service.events()
+            .patch(
+                calendarId=calendar_id,
+                eventId=str(record["id"]),
+                body=google_event_end_patch(record),
+            )
+            .execute()
+        )
+        return True
+    except Exception as error:
+        if google_error_status(error) == 404:
+            return False
+        raise
+
+
+def queue_missing_extension_as_new_event(
+    events: list[dict[str, object]],
+    record: dict[str, object],
+) -> dict[str, object] | None:
+    synced_end_text = record.get("synced_end")
+    if not isinstance(synced_end_text, str) or not synced_end_text:
+        synced_end_text = str(record["start"])
+    extension_start = parse_iso_datetime(synced_end_text, "synced_end")
+    extension_end = parse_iso_datetime(record["end"], "outbox event end")
+    if extension_start >= extension_end:
+        record["status"] = INSERTED
+        record["end"] = synced_end_text
+        return None
+
+    record["end"] = synced_end_text
+    record["status"] = INSERTED
+    new_record = calendar_event_record(
+        CalendarEventDraft(
+            activity=str(record["activity"]),
+            activity_key=str(record["activity_key"]),
+            start=extension_start,
+            end=extension_end,
+        )
+    )
+    events.append(new_record)
+    return new_record
+
+
+def sync_google_calendar_events(
+    log_dir: Path,
+    service=None,
+    raise_on_unavailable: bool = False,
+) -> int:
+    state = load_google_calendar_state(log_dir)
+    calendar_id = state.get("calendar_id")
+    if not isinstance(calendar_id, str) or not calendar_id:
+        message = (
+            "Google Calendar has no calendar_id yet. Run "
+            "--setup-google-calendar first."
+        )
+        if raise_on_unavailable:
+            raise GoogleCalendarUnavailable(message)
+        print(f"Warning: {message}", file=sys.stderr)
+        return 0
+
+    if service is None:
+        try:
+            service = google_calendar_service(log_dir)
+        except GoogleCalendarUnavailable:
+            if raise_on_unavailable:
+                raise
+            print(
+                "Warning: Google Calendar is not configured; queued events will retry later.",
+                file=sys.stderr,
+            )
+            return 0
+
+    outbox = load_google_event_outbox(log_dir)
+    events = outbox_events(outbox)
+    synced_count = 0
+
+    event_index = 0
+    while event_index < len(events):
+        record = events[event_index]
+        status = record.get("status")
+        try:
+            if status == PENDING_INSERT:
+                insert_google_event(service, calendar_id, record)
+                record["status"] = INSERTED
+                record["synced_end"] = record["end"]
+                synced_count += 1
+                save_google_event_outbox(log_dir, outbox)
+            elif status == PENDING_EXTEND:
+                if extend_google_event(service, calendar_id, record):
+                    record["status"] = INSERTED
+                    record["synced_end"] = record["end"]
+                    synced_count += 1
+                    save_google_event_outbox(log_dir, outbox)
+                else:
+                    new_record = queue_missing_extension_as_new_event(events, record)
+                    if new_record is not None:
+                        outbox["latest_event_id"] = new_record["id"]
+                    save_google_event_outbox(log_dir, outbox)
+                    continue
+        except Exception:
+            save_google_event_outbox(log_dir, outbox)
+            raise
+        event_index += 1
+
+    return synced_count
+
+
+def best_effort_sync_google_calendar(log_dir: Path) -> None:
+    try:
+        sync_google_calendar_events(log_dir)
+    except Exception as error:
+        print(
+            f"Warning: Google Calendar sync failed; queued events will retry later: {error}",
+            file=sys.stderr,
+        )
+
+
+def setup_google_calendar(notes_dir: Path, credentials_path: Path) -> int:
+    log_dir = notes_dir / LOG_DIR_NAME
+    log_dir.mkdir(parents=True, exist_ok=True)
+    service = google_calendar_service(
+        log_dir,
+        credentials_path=credentials_path,
+        interactive=True,
+    )
+    calendar_id = ensure_google_calendar(log_dir, service)
+    synced_count = sync_google_calendar_events(
+        log_dir,
+        service=service,
+        raise_on_unavailable=True,
+    )
+    print(f"Google Calendar configured: {calendar_id}")
+    print(f"Synced queued events: {synced_count}")
+    return 0
+
+
 def append_segments(log_dir: Path, segments: list[ActivitySegment]) -> None:
     log_path = log_dir / LOG_FILE_NAME
     with log_path.open("a", encoding="utf-8") as log_file:
@@ -630,13 +1058,37 @@ def run(notes_dir: Path, now: datetime) -> int:
 
     append_segments(log_dir, segments)
     save_state(log_dir, segments, state)
+    try:
+        queue_google_calendar_events(log_dir, segments)
+        best_effort_sync_google_calendar(log_dir)
+    except Exception as error:
+        print(
+            f"Warning: Google Calendar queueing failed after local log save: {error}",
+            file=sys.stderr,
+        )
     return 0
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--notes-dir", type=Path, default=NOTES_DIR)
+    parser.add_argument("--setup-google-calendar", action="store_true")
+    parser.add_argument("--sync-google-calendar", action="store_true")
+    parser.add_argument("--google-credentials", type=Path)
     args = parser.parse_args()
+
+    if args.setup_google_calendar:
+        if args.google_credentials is None:
+            parser.error("--setup-google-calendar requires --google-credentials")
+        raise SystemExit(setup_google_calendar(args.notes_dir, args.google_credentials))
+
+    if args.sync_google_calendar:
+        log_dir = args.notes_dir / LOG_DIR_NAME
+        log_dir.mkdir(parents=True, exist_ok=True)
+        synced_count = sync_google_calendar_events(log_dir, raise_on_unavailable=True)
+        print(f"Synced queued events: {synced_count}")
+        raise SystemExit(0)
+
     raise SystemExit(run(args.notes_dir, local_now()))
 
 

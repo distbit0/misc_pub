@@ -12,6 +12,9 @@ dependencies = [
     "requests",
     "pandas>=3.0.2",
     "matplotlib>=3.10.8",
+    "google-api-python-client>=2.198.0",
+    "google-auth-httplib2>=0.4.0",
+    "google-auth-oauthlib>=1.4.0",
 ]
 requires-python = ">=3.13"
 license = {text = "UNLICENCE"}
