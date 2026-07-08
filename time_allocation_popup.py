@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 import hashlib
 import html
 import json
@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from zoneinfo import ZoneInfo
 
 DEFAULT_LOOKBACK = timedelta(minutes=30)
 POPUP_TIMEOUT_SECONDS = 4 * 60
@@ -25,9 +26,12 @@ STATE_FILE_NAME = "state.json"
 GOOGLE_CALENDAR_STATE_FILE_NAME = "google-calendar-state.json"
 GOOGLE_EVENT_OUTBOX_FILE_NAME = "google-event-outbox.json"
 GOOGLE_TOKEN_FILE_NAME = "google-token.json"
+GOOGLE_CALENDAR_ICS_FILE_NAME = "time-allocation.ics"
 GOOGLE_CALENDAR_NAME = "Time Allocation"
 GOOGLE_CALENDAR_TIME_ZONE = "Asia/Ho_Chi_Minh"
 GOOGLE_CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar.app.created"]
+PRODUCTIVE_MARKER = "!"
+PRODUCTIVE_GOOGLE_EVENT_COLOR_ID = "10"
 PENDING_INSERT = "pending_insert"
 PENDING_EXTEND = "pending_extend"
 INSERTED = "inserted"
@@ -73,6 +77,13 @@ class CalendarEventDraft:
     activity_key: str
     start: datetime
     end: datetime
+
+
+@dataclass(frozen=True)
+class GoogleCalendarSnapshot:
+    service: object
+    calendar_id: str
+    events: list[dict[str, object]]
 
 
 class GoogleCalendarUnavailable(RuntimeError):
@@ -185,6 +196,10 @@ def normalize_activity_name(activity: str, last_activity: str | None) -> str:
 
 def activity_key(activity: str) -> str:
     return "".join(activity.split()).casefold()
+
+
+def is_productive_activity(activity: str) -> bool:
+    return PRODUCTIVE_MARKER in activity
 
 
 def google_event_id_for(activity_key_value: str, start: datetime, end: datetime) -> str:
@@ -301,16 +316,20 @@ def parse_activity_segments(
     )
 
 
+def default_state(now: datetime) -> dict[str, object]:
+    cursor_time = now - DEFAULT_LOOKBACK
+    return {
+        "cursor_time": cursor_time.isoformat(),
+        "last_activity": "",
+        "last_activity_end": "",
+        "last_activity_run_start": "",
+    }
+
+
 def load_state(log_dir: Path, now: datetime) -> dict[str, object]:
     state_path = log_dir / STATE_FILE_NAME
     if not state_path.exists():
-        cursor_time = now - DEFAULT_LOOKBACK
-        return {
-            "cursor_time": cursor_time.isoformat(),
-            "last_activity": "",
-            "last_activity_end": "",
-            "last_activity_run_start": "",
-        }
+        return default_state(now)
 
     with state_path.open("r", encoding="utf-8") as state_file:
         state = json.load(state_file)
@@ -578,6 +597,10 @@ def google_token_path(log_dir: Path) -> Path:
     return log_dir / GOOGLE_TOKEN_FILE_NAME
 
 
+def google_calendar_ics_path(log_dir: Path) -> Path:
+    return log_dir / GOOGLE_CALENDAR_ICS_FILE_NAME
+
+
 def load_google_calendar_state(log_dir: Path) -> dict[str, object]:
     return read_json_object(google_calendar_state_path(log_dir), {})
 
@@ -598,7 +621,17 @@ def load_google_event_outbox(log_dir: Path) -> dict[str, object]:
 
 
 def save_google_event_outbox(log_dir: Path, outbox: dict[str, object]) -> None:
-    write_json_object(google_event_outbox_path(log_dir), outbox)
+    pending_events = [
+        event
+        for event in outbox_events(outbox)
+        if event.get("status") != INSERTED
+    ]
+    pending_outbox = dict(outbox)
+    pending_outbox["events"] = pending_events
+    pending_outbox["latest_event_id"] = (
+        pending_events[-1].get("id") if pending_events else ""
+    )
+    write_json_object(google_event_outbox_path(log_dir), pending_outbox)
 
 
 def outbox_events(outbox: dict[str, object]) -> list[dict[str, object]]:
@@ -623,26 +656,49 @@ def calendar_event_record(draft: CalendarEventDraft) -> dict[str, object]:
     }
 
 
-def find_event_record(
+def calendar_extension_record(
+    event_id: str,
+    draft: CalendarEventDraft,
+) -> dict[str, object]:
+    return {
+        "id": event_id,
+        "activity": draft.activity,
+        "activity_key": draft.activity_key,
+        "start": draft.start.isoformat(),
+        "end": draft.end.isoformat(),
+        "synced_end": draft.start.isoformat(),
+        "status": PENDING_EXTEND,
+    }
+
+
+def latest_pending_event_record(
     events: list[dict[str, object]],
-    event_id: object,
 ) -> dict[str, object] | None:
-    if not isinstance(event_id, str) or not event_id:
+    pending_events = [
+        event
+        for event in events
+        if event.get("status") in {PENDING_INSERT, PENDING_EXTEND}
+    ]
+    if not pending_events:
         return None
-    return next(
-        (event for event in events if event.get("id") == event_id),
-        None,
+    return max(
+        pending_events,
+        key=lambda event: parse_iso_datetime(event.get("end"), "outbox event end"),
     )
 
 
-def queue_google_calendar_events(log_dir: Path, segments: list[ActivitySegment]) -> None:
+def queue_google_calendar_events(
+    log_dir: Path,
+    segments: list[ActivitySegment],
+    latest_synced_event: dict[str, object] | None = None,
+) -> None:
     drafts = merge_calendar_event_drafts(segments)
     if not drafts:
         return
 
     outbox = load_google_event_outbox(log_dir)
     events = outbox_events(outbox)
-    latest_event = find_event_record(events, outbox.get("latest_event_id"))
+    latest_event = latest_pending_event_record(events)
 
     if latest_event is not None:
         latest_key = latest_event.get("activity_key")
@@ -650,9 +706,23 @@ def queue_google_calendar_events(log_dir: Path, segments: list[ActivitySegment])
         first_draft = drafts[0]
         if latest_key == first_draft.activity_key and latest_end == first_draft.start:
             latest_event["end"] = first_draft.end.isoformat()
-            if latest_event.get("status") == INSERTED:
-                latest_event["status"] = PENDING_EXTEND
             outbox["latest_event_id"] = latest_event["id"]
+            drafts = drafts[1:]
+
+    if drafts and latest_synced_event is not None:
+        first_draft = drafts[0]
+        event_id = latest_synced_event.get("id")
+        event_summary = google_event_activity(latest_synced_event)
+        event_end = google_event_datetime(latest_synced_event, "end")
+        if (
+            isinstance(event_id, str)
+            and event_summary is not None
+            and event_end == first_draft.start
+            and activity_key(event_summary) == first_draft.activity_key
+        ):
+            extension_record = calendar_extension_record(event_id, first_draft)
+            events.append(extension_record)
+            outbox["latest_event_id"] = extension_record["id"]
             drafts = drafts[1:]
 
     for draft in drafts:
@@ -664,7 +734,7 @@ def queue_google_calendar_events(log_dir: Path, segments: list[ActivitySegment])
 
 
 def google_event_body(record: dict[str, object]) -> dict[str, object]:
-    return {
+    body = {
         "id": str(record["id"]),
         "summary": str(record["activity"]),
         "start": {
@@ -677,6 +747,9 @@ def google_event_body(record: dict[str, object]) -> dict[str, object]:
         },
         "description": "Created by time_allocation_popup.py",
     }
+    if is_productive_activity(str(record["activity"])):
+        body["colorId"] = PRODUCTIVE_GOOGLE_EVENT_COLOR_ID
+    return body
 
 
 def google_event_end_patch(record: dict[str, object]) -> dict[str, object]:
@@ -686,6 +759,248 @@ def google_event_end_patch(record: dict[str, object]) -> dict[str, object]:
             "timeZone": GOOGLE_CALENDAR_TIME_ZONE,
         }
     }
+
+
+def google_calendar_events(service, calendar_id: str) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    page_token = None
+    while True:
+        request = service.events().list(
+            calendarId=calendar_id,
+            singleEvents=True,
+            orderBy="startTime",
+            showDeleted=False,
+            maxResults=2500,
+            pageToken=page_token,
+        )
+        response = request.execute()
+        items = response.get("items", [])
+        if not isinstance(items, list):
+            raise ValueError("Google Calendar events response did not include a list.")
+        for item in items:
+            if isinstance(item, dict):
+                events.append(item)
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return events
+
+
+def google_event_datetime(event: dict[str, object], field_name: str) -> datetime | None:
+    raw_time = event.get(field_name)
+    if not isinstance(raw_time, dict):
+        return None
+    date_time = raw_time.get("dateTime")
+    if not isinstance(date_time, str) or not date_time.strip():
+        return None
+    return parse_iso_datetime(date_time, f"Google Calendar event {field_name}")
+
+
+def google_event_activity(event: dict[str, object]) -> str | None:
+    summary = event.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    return summary
+
+
+def google_event_logged_activity(event: dict[str, object]) -> LoggedActivity | None:
+    activity = google_event_activity(event)
+    start = google_event_datetime(event, "start")
+    end = google_event_datetime(event, "end")
+    if activity is None or start is None or end is None or end <= start:
+        return None
+    return LoggedActivity(activity=activity, start=start, end=end)
+
+
+def google_event_end(event: dict[str, object]) -> datetime | None:
+    return google_event_datetime(event, "end")
+
+
+def latest_google_event(events: list[dict[str, object]]) -> dict[str, object] | None:
+    timed_events = [
+        event
+        for event in events
+        if google_event_activity(event) is not None and google_event_end(event) is not None
+    ]
+    return max(timed_events, key=lambda event: google_event_end(event) or datetime.min) if timed_events else None
+
+
+def outbox_logged_activity(record: dict[str, object]) -> LoggedActivity:
+    return LoggedActivity(
+        activity=str(record["activity"]),
+        start=parse_iso_datetime(record.get("start"), "outbox event start"),
+        end=parse_iso_datetime(record.get("end"), "outbox event end"),
+    )
+
+
+def logged_activities_from_google_events(
+    events: list[dict[str, object]],
+) -> list[LoggedActivity]:
+    logged_activities: list[LoggedActivity] = []
+    for event in events:
+        logged_activity = google_event_logged_activity(event)
+        if logged_activity is not None:
+            logged_activities.append(logged_activity)
+    return logged_activities
+
+
+def logged_activities_from_pending_outbox(log_dir: Path) -> list[LoggedActivity]:
+    return [
+        outbox_logged_activity(record)
+        for record in outbox_events(load_google_event_outbox(log_dir))
+        if record.get("status") in {PENDING_INSERT, PENDING_EXTEND}
+    ]
+
+
+def state_from_logged_activities(
+    logged_activities: list[LoggedActivity],
+    now: datetime,
+) -> dict[str, object]:
+    if not logged_activities:
+        return default_state(now)
+
+    activities = sorted(logged_activities, key=lambda activity: (activity.end, activity.start))
+    latest_activity = activities[-1]
+    latest_key = activity_key(latest_activity.activity)
+    run_start = latest_activity.start
+    for previous_activity in reversed(activities[:-1]):
+        if previous_activity.end != run_start:
+            break
+        if activity_key(previous_activity.activity) != latest_key:
+            break
+        run_start = previous_activity.start
+
+    return {
+        "cursor_time": latest_activity.end.isoformat(),
+        "last_activity": latest_activity.activity,
+        "last_activity_end": latest_activity.end.isoformat(),
+        "last_activity_run_start": run_start.isoformat(),
+    }
+
+
+def runtime_state_from_google_calendar(
+    log_dir: Path,
+    events: list[dict[str, object]],
+    now: datetime,
+) -> dict[str, object]:
+    return state_from_logged_activities(
+        logged_activities_from_google_events(events)
+        + logged_activities_from_pending_outbox(log_dir),
+        now,
+    )
+
+
+def escape_ics_text(value: object) -> str:
+    text = str(value)
+    return (
+        text.replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def fold_ics_line(line: str) -> list[str]:
+    if len(line) <= 75:
+        return [line]
+    folded_lines = [line[:75]]
+    cursor = 75
+    while cursor < len(line):
+        folded_lines.append(f" {line[cursor:cursor + 74]}")
+        cursor += 74
+    return folded_lines
+
+
+def format_ics_datetime(value: datetime) -> str:
+    local_value = value.astimezone(ZoneInfo(GOOGLE_CALENDAR_TIME_ZONE))
+    return local_value.strftime("%Y%m%dT%H%M%S")
+
+
+def format_ics_utc_datetime(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def google_event_ics_lines(
+    event: dict[str, object],
+    generated_at: datetime,
+) -> list[str]:
+    event_id = event.get("id")
+    activity = google_event_activity(event)
+    start = google_event_datetime(event, "start")
+    end = google_event_datetime(event, "end")
+    if not isinstance(event_id, str) or activity is None or start is None or end is None:
+        return []
+
+    updated_text = event.get("updated")
+    updated = (
+        parse_iso_datetime(updated_text, "Google Calendar event updated")
+        if isinstance(updated_text, str) and updated_text.strip()
+        else generated_at
+    )
+    lines = [
+        "BEGIN:VEVENT",
+        f"UID:{escape_ics_text(event.get('iCalUID') or event_id)}",
+        f"DTSTAMP:{format_ics_utc_datetime(updated)}",
+        f"DTSTART;TZID={GOOGLE_CALENDAR_TIME_ZONE}:{format_ics_datetime(start)}",
+        f"DTEND;TZID={GOOGLE_CALENDAR_TIME_ZONE}:{format_ics_datetime(end)}",
+        f"SUMMARY:{escape_ics_text(activity)}",
+    ]
+    description = event.get("description")
+    if isinstance(description, str) and description:
+        lines.append(f"DESCRIPTION:{escape_ics_text(description)}")
+    color_id = event.get("colorId")
+    if isinstance(color_id, str) and color_id:
+        lines.append(f"X-GOOGLE-CALENDAR-COLOR-ID:{escape_ics_text(color_id)}")
+    if color_id == PRODUCTIVE_GOOGLE_EVENT_COLOR_ID:
+        lines.append("CATEGORIES:Productive")
+    lines.append("END:VEVENT")
+    return lines
+
+
+def google_calendar_ics_text(
+    calendar_id: str,
+    events: list[dict[str, object]],
+    generated_at: datetime,
+) -> str:
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//time_allocation_popup.py//EN",
+        f"X-WR-CALNAME:{escape_ics_text(GOOGLE_CALENDAR_NAME)}",
+        f"X-WR-TIMEZONE:{GOOGLE_CALENDAR_TIME_ZONE}",
+        f"X-GOOGLE-CALENDAR-ID:{escape_ics_text(calendar_id)}",
+    ]
+    for event in events:
+        lines.extend(google_event_ics_lines(event, generated_at))
+    lines.append("END:VCALENDAR")
+
+    folded_lines: list[str] = []
+    for line in lines:
+        folded_lines.extend(fold_ics_line(line))
+    return "\r\n".join(folded_lines) + "\r\n"
+
+
+def write_google_calendar_ics(
+    log_dir: Path,
+    calendar_id: str,
+    events: list[dict[str, object]],
+    generated_at: datetime,
+) -> None:
+    google_calendar_ics_path(log_dir).write_text(
+        google_calendar_ics_text(calendar_id, events, generated_at),
+        encoding="utf-8",
+    )
+
+
+def refresh_google_calendar_ics(
+    log_dir: Path,
+    service,
+    calendar_id: str,
+    now: datetime,
+) -> list[dict[str, object]]:
+    events = google_calendar_events(service, calendar_id)
+    write_google_calendar_ics(log_dir, calendar_id, events, now)
+    return events
 
 
 def save_google_credentials(token_path: Path, credentials) -> None:
@@ -759,6 +1074,54 @@ def ensure_google_calendar(
         },
     )
     return calendar_id
+
+
+def configured_google_calendar_id(log_dir: Path) -> str:
+    state = load_google_calendar_state(log_dir)
+    calendar_id = state.get("calendar_id")
+    if not isinstance(calendar_id, str) or not calendar_id:
+        raise GoogleCalendarUnavailable(
+            "Google Calendar has no calendar_id yet. Run --setup-google-calendar first."
+        )
+    return calendar_id
+
+
+def refresh_google_calendar_snapshot(
+    log_dir: Path,
+    now: datetime,
+    service=None,
+    raise_on_unavailable: bool = False,
+) -> GoogleCalendarSnapshot | None:
+    try:
+        calendar_id = configured_google_calendar_id(log_dir)
+        active_service = service or google_calendar_service(log_dir)
+        sync_google_calendar_events(
+            log_dir,
+            service=active_service,
+            raise_on_unavailable=True,
+        )
+        events = refresh_google_calendar_ics(log_dir, active_service, calendar_id, now)
+        return GoogleCalendarSnapshot(
+            service=active_service,
+            calendar_id=calendar_id,
+            events=events,
+        )
+    except GoogleCalendarUnavailable:
+        if raise_on_unavailable:
+            raise
+        print(
+            "Warning: Google Calendar is unavailable; using pending local queue/state only.",
+            file=sys.stderr,
+        )
+        return None
+    except Exception as error:
+        if raise_on_unavailable:
+            raise
+        print(
+            f"Warning: Google Calendar refresh failed; using pending local queue/state only: {error}",
+            file=sys.stderr,
+        )
+        return None
 
 
 def insert_google_event(service, calendar_id: str, record: dict[str, object]) -> bool:
@@ -852,6 +1215,15 @@ def sync_google_calendar_events(
 
     outbox = load_google_event_outbox(log_dir)
     events = outbox_events(outbox)
+    pending_events = [
+        event
+        for event in events
+        if event.get("status") != INSERTED
+    ]
+    if len(pending_events) != len(events):
+        outbox["events"] = pending_events
+        events = pending_events
+        save_google_event_outbox(log_dir, outbox)
     synced_count = 0
 
     event_index = 0
@@ -885,19 +1257,10 @@ def sync_google_calendar_events(
     return synced_count
 
 
-def best_effort_sync_google_calendar(log_dir: Path) -> None:
-    try:
-        sync_google_calendar_events(log_dir)
-    except Exception as error:
-        print(
-            f"Warning: Google Calendar sync failed; queued events will retry later: {error}",
-            file=sys.stderr,
-        )
-
-
 def setup_google_calendar(notes_dir: Path, credentials_path: Path) -> int:
     log_dir = notes_dir / LOG_DIR_NAME
     log_dir.mkdir(parents=True, exist_ok=True)
+    now = local_now()
     service = google_calendar_service(
         log_dir,
         credentials_path=credentials_path,
@@ -909,15 +1272,11 @@ def setup_google_calendar(notes_dir: Path, credentials_path: Path) -> int:
         service=service,
         raise_on_unavailable=True,
     )
+    refresh_google_calendar_ics(log_dir, service, calendar_id, now)
     print(f"Google Calendar configured: {calendar_id}")
     print(f"Synced queued events: {synced_count}")
+    print(f"ICS mirror: {google_calendar_ics_path(log_dir)}")
     return 0
-
-
-def append_segments(log_dir: Path, segments: list[ActivitySegment]) -> None:
-    log_path = log_dir / LOG_FILE_NAME
-    with log_path.open("a", encoding="utf-8") as log_file:
-        log_file.write(segments_log_text(segments))
 
 
 def format_clock_time(value: datetime) -> str:
@@ -982,7 +1341,7 @@ def popup_text(
         else ""
     )
     review_block = (
-        f'\n\n<span font_desc="Monospace 18"><b>Would append:</b>\n'
+        f'\n\n<span font_desc="Monospace 18"><b>Would log:</b>\n'
         f"{html.escape(review_text.rstrip())}</span>"
         if review_text
         else ""
@@ -1038,7 +1397,18 @@ def run(
 ) -> int:
     log_dir = notes_dir / LOG_DIR_NAME
     log_dir.mkdir(parents=True, exist_ok=True)
-    state = load_state(log_dir, now)
+    snapshot = refresh_google_calendar_snapshot(log_dir, now)
+    if snapshot is None:
+        pending_activities = logged_activities_from_pending_outbox(log_dir)
+        state = (
+            state_from_logged_activities(pending_activities, now)
+            if pending_activities
+            else load_state(log_dir, now)
+        )
+        calendar_events: list[dict[str, object]] = []
+    else:
+        state = runtime_state_from_google_calendar(log_dir, snapshot.events, now)
+        calendar_events = snapshot.events
     period_start = parse_iso_datetime(state["cursor_time"], "cursor_time")
     if period_start >= now:
         print("No unaccounted time yet.", file=sys.stderr)
@@ -1090,16 +1460,25 @@ def run(
 
         break
 
-    append_segments(log_dir, segments)
-    save_state(log_dir, segments, state)
     try:
-        queue_google_calendar_events(log_dir, segments)
-        best_effort_sync_google_calendar(log_dir)
+        queue_google_calendar_events(
+            log_dir,
+            segments,
+            latest_synced_event=latest_google_event(calendar_events),
+        )
     except Exception as error:
         print(
-            f"Warning: Google Calendar queueing failed after local log save: {error}",
+            f"Error: Google Calendar queueing failed; no time was logged: {error}",
             file=sys.stderr,
         )
+        return 1
+
+    save_state(log_dir, segments, state)
+    refresh_google_calendar_snapshot(
+        log_dir,
+        now,
+        service=snapshot.service if snapshot is not None else None,
+    )
     return 0
 
 
@@ -1120,8 +1499,16 @@ def main() -> None:
     if args.sync_google_calendar:
         log_dir = args.notes_dir / LOG_DIR_NAME
         log_dir.mkdir(parents=True, exist_ok=True)
-        synced_count = sync_google_calendar_events(log_dir, raise_on_unavailable=True)
+        service = google_calendar_service(log_dir)
+        calendar_id = configured_google_calendar_id(log_dir)
+        synced_count = sync_google_calendar_events(
+            log_dir,
+            service=service,
+            raise_on_unavailable=True,
+        )
+        refresh_google_calendar_ics(log_dir, service, calendar_id, local_now())
         print(f"Synced queued events: {synced_count}")
+        print(f"ICS mirror: {google_calendar_ics_path(log_dir)}")
         raise SystemExit(0)
 
     raise SystemExit(run(args.notes_dir, local_now(), args.hide_help_by_default))
