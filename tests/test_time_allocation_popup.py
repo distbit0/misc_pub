@@ -598,6 +598,22 @@ def test_load_state_backfills_run_start_from_single_log_file(tmp_path: Path) -> 
     assert state["last_activity_run_start"] == at(17, 30).isoformat()
 
 
+def test_runtime_state_ignores_future_calendar_events(tmp_path: Path) -> None:
+    events = [
+        google_event("past-1", "work", at(10), at(11)),
+        google_event("future-1", "walk", at(23), at(23, 45)),
+    ]
+
+    state = time_allocation_popup.runtime_state_from_google_calendar(
+        tmp_path,
+        events,
+        at(15),
+    )
+
+    assert state["cursor_time"] == at(11).isoformat()
+    assert state["last_activity"] == "work"
+
+
 def test_invalid_input_reopens_prompt_with_previous_text(monkeypatch, tmp_path: Path) -> None:
     prompts: list[tuple[str, str]] = []
     responses = iter(

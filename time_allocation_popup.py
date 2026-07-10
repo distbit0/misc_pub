@@ -855,10 +855,15 @@ def state_from_logged_activities(
     logged_activities: list[LoggedActivity],
     now: datetime,
 ) -> dict[str, object]:
-    if not logged_activities:
+    completed_activities = [
+        logged_activity
+        for logged_activity in logged_activities
+        if logged_activity.end <= now
+    ]
+    if not completed_activities:
         return default_state(now)
 
-    activities = sorted(logged_activities, key=lambda activity: (activity.end, activity.start))
+    activities = sorted(completed_activities, key=lambda activity: (activity.end, activity.start))
     latest_activity = activities[-1]
     latest_key = activity_key(latest_activity.activity)
     run_start = latest_activity.start
