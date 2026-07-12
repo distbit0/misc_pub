@@ -1,0 +1,30 @@
+{
+  "globalM2Btc": {
+    "outputDir": "/home/pimania/dev/misc/output/global_m2_btc",
+    "logPath": "/home/pimania/dev/misc/output/global_m2_btc/global_m2_btc.log",
+    "logRotation": "5 MB",
+    "leadMonths": 3,
+    "focusYears": 5,
+    "correlationWindowMonths": 12,
+    "macroMicro": {
+      "url": "https://en.macromicro.me/charts/data/3439",
+      "referer": "https://en.macromicro.me/charts/3439/major-bank-m2-comparsion",
+      "acceptLanguage": "en-GB,en;q=0.6",
+      "userAgent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Mobile Safari/537.36",
+      "headers": {
+        "cache-control": "no-cache",
+        "content-type": "application/json",
+        "docref": "",
+        "pragma": "no-cache",
+        "priority": "u=1, i",
+        "sec-ch-ua": "\"Not(A:Brand\";v=\"8\", \"Chromium\";v=\"144\", \"Brave\";v=\"144\"",
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": "\"Android\"",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "sec-gpc": "1"
+      }
+    }
+  }
+}

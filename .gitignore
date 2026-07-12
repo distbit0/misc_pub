@@ -91,3 +91,4 @@ profile_default/
 # output and storage
 output/
 data/
+**/node_modules/
