@@ -1393,7 +1393,6 @@ def ask_with_yad(
         "--entry",
         "--title=Time allocation",
         "--undecorated",
-        "--width=980",
         f"--fontname={POPUP_FONT}",
         f"--css={POPUP_CSS}",
         "--text",
