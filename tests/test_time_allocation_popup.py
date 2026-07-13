@@ -162,7 +162,8 @@ def test_popup_header_uses_compact_record_fields() -> None:
         at(22),
     )
 
-    assert "last:\nClean room (1.7h ago) @ 8:20pm\nlen 2.5h" in text
+    assert "Clean room (1.7h ago) @ 8:20pm\nlen 2.5h" in text
+    assert "last:" not in text
     assert 'font_desc="Sans 18"' in text
     assert "CSV: activity" in text
     assert "Last:" not in text
@@ -184,7 +185,7 @@ def test_popup_can_hide_help_without_changing_status_font() -> None:
     )
 
     assert (
-        "last:\nfigure out what to do next for truesight (0.1h ago) @ 9:40pm\n"
+        "figure out what to do next for truesight (0.1h ago) @ 9:40pm\n"
         "len 0.7h"
     ) in text
     assert 'font_desc="Sans 18"' in text

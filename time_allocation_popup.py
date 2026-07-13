@@ -1356,7 +1356,7 @@ def popup_text(
             f"{last_activity} ({time_since_last_activity} ago) @ {last_activity_end_text}"
         )
 
-    status_lines = ["last:", last_activity_line]
+    status_lines = [last_activity_line]
     if last_activity_duration is not None:
         status_lines.append(f"len {last_activity_duration}")
     status_text = html.escape("\n".join(status_lines))
