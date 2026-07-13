@@ -19,6 +19,26 @@ DEFAULT_LOOKBACK = timedelta(minutes=30)
 POPUP_TIMEOUT_SECONDS = 4 * 60
 POPUP_FONT = "Sans 18"
 STATUS_FONT = POPUP_FONT
+POPUP_CSS = """
+* {
+    background-color: #000000;
+    background-image: none;
+    border-color: #00ff00;
+    box-shadow: none;
+    caret-color: #00ff00;
+    color: #00ff00;
+    outline-color: #00ff00;
+    text-shadow: none;
+}
+*:disabled {
+    opacity: 1;
+}
+button:active, button:checked, button:focus, button:hover,
+entry selection, progressbar progress {
+    background-color: #00ff00;
+    color: #000000;
+}
+""".strip()
 NOTES_DIR = Path.home() / "notes"
 LOG_DIR_NAME = "time-allocation"
 LOG_FILE_NAME = "time-allocation.txt"
@@ -1294,12 +1314,11 @@ def format_clock_time(value: datetime) -> str:
 
 def format_display_hours(duration: timedelta) -> str:
     hours = max(0, duration.total_seconds()) / 3600
-    return f"{hours:.1f}h"
+    return f"{hours:.1f}".removesuffix(".0") + "h"
 
 
 def popup_text(
     state: dict[str, object],
-    period_start: datetime,
     now: datetime,
     error_message: str | None = None,
     review_text: str | None = None,
@@ -1318,7 +1337,7 @@ def popup_text(
         last_activity_end_text = "none"
 
     last_activity_run_start = state.get("last_activity_run_start")
-    duration_line = None
+    last_activity_duration = None
     if (
         parsed_last_activity_end is not None
         and isinstance(last_activity_run_start, str)
@@ -1328,20 +1347,21 @@ def popup_text(
             last_activity_run_start,
             "last_activity_run_start",
         )
-        duration_line = f"{format_display_hours(parsed_last_activity_end - run_start)} len"
+        last_activity_duration = format_display_hours(parsed_last_activity_end - run_start)
 
-    status_lines = ["last:", last_activity, ""]
-    if duration_line is not None:
-        status_lines.append(duration_line)
-    status_lines.extend(
-        [
-            f"{last_activity_end_text} end",
-            f"{format_display_hours(now - period_start)} ago",
-        ]
-    )
+    last_activity_line = last_activity
+    if parsed_last_activity_end is not None:
+        time_since_last_activity = format_display_hours(now - parsed_last_activity_end)
+        last_activity_line = (
+            f"{last_activity} ({time_since_last_activity} ago) @ {last_activity_end_text}"
+        )
+
+    status_lines = ["last:", last_activity_line]
+    if last_activity_duration is not None:
+        status_lines.append(f"len {last_activity_duration}")
     status_text = html.escape("\n".join(status_lines))
     error_block = (
-        f'<span foreground="red"><b>Error:</b> {html.escape(error_message)}</span>\n\n'
+        f'<span><b>Error:</b> {html.escape(error_message)}</span>\n\n'
         if error_message
         else ""
     )
@@ -1372,8 +1392,10 @@ def ask_with_yad(
         "yad",
         "--entry",
         "--title=Time allocation",
+        "--undecorated",
         "--width=980",
         f"--fontname={POPUP_FONT}",
+        f"--css={POPUP_CSS}",
         "--text",
         message,
         "--entry-text",
@@ -1427,10 +1449,9 @@ def run(
         response = ask_with_yad(
             popup_text(
                 state,
-                period_start,
                 now,
-                error_message,
-                review_text,
+                error_message=error_message,
+                review_text=review_text,
                 show_help=help_visible,
             ),
             entry_text,

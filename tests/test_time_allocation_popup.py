@@ -159,11 +159,10 @@ def test_popup_header_uses_compact_record_fields() -> None:
             "last_activity_end": at(20, 20).isoformat(),
             "last_activity_run_start": at(17, 50).isoformat(),
         },
-        at(20, 20),
         at(22),
     )
 
-    assert "last:\nClean room\n\n2.5h len\n8:20pm end\n1.7h ago" in text
+    assert "last:\nClean room (1.7h ago) @ 8:20pm\nlen 2.5h" in text
     assert 'font_desc="Sans 18"' in text
     assert "CSV: activity" in text
     assert "Last:" not in text
@@ -180,18 +179,31 @@ def test_popup_can_hide_help_without_changing_status_font() -> None:
             "last_activity_end": at(21, 40).isoformat(),
             "last_activity_run_start": at(21).isoformat(),
         },
-        at(21, 40),
         at(21, 46),
         show_help=False,
     )
 
     assert (
-        "last:\nfigure out what to do next for truesight\n"
-        "\n0.7h len\n9:40pm end\n0.1h ago"
+        "last:\nfigure out what to do next for truesight (0.1h ago) @ 9:40pm\n"
+        "len 0.7h"
     ) in text
     assert 'font_desc="Sans 18"' in text
     assert "CSV: activity" not in text
     assert "Examples:" not in text
+
+
+def test_popup_hours_omit_redundant_decimal() -> None:
+    text = time_allocation_popup.popup_text(
+        {
+            "last_activity": "work",
+            "last_activity_end": at(20).isoformat(),
+            "last_activity_run_start": at(19).isoformat(),
+        },
+        at(22),
+        show_help=False,
+    )
+
+    assert "work (2h ago) @ 8pm\nlen 1h" in text
 
 
 def test_activity_with_duration_leaves_remainder_unaccounted() -> None:
