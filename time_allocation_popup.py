@@ -1323,6 +1323,7 @@ def popup_text(
     error_message: str | None = None,
     review_text: str | None = None,
     show_help: bool = True,
+    recent_only: bool = False,
 ) -> str:
     last_activity = str(state.get("last_activity") or "none")
     last_activity_end = state.get("last_activity_end")
@@ -1359,6 +1360,8 @@ def popup_text(
     status_lines = [last_activity_line]
     if last_activity_duration is not None:
         status_lines.append(f"len {last_activity_duration}")
+    if recent_only:
+        status_lines.append("Only the last 30m needs logging.")
     status_text = html.escape("\n".join(status_lines))
     error_block = (
         f'<span><b>Error:</b> {html.escape(error_message)}</span>\n\n'
@@ -1420,6 +1423,7 @@ def run(
     notes_dir: Path,
     now: datetime,
     hide_help_by_default: bool = False,
+    recent_only_after_hours: float | None = None,
 ) -> int:
     log_dir = notes_dir / LOG_DIR_NAME
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1439,6 +1443,12 @@ def run(
     if period_start >= now:
         print("No unaccounted time yet.", file=sys.stderr)
         return 0
+    recent_only = (
+        recent_only_after_hours is not None
+        and now - period_start > timedelta(hours=recent_only_after_hours)
+    )
+    if recent_only:
+        period_start = max(period_start, now - DEFAULT_LOOKBACK)
 
     entry_text = ""
     error_message = None
@@ -1452,6 +1462,7 @@ def run(
                 error_message=error_message,
                 review_text=review_text,
                 show_help=help_visible,
+                recent_only=recent_only,
             ),
             entry_text,
             show_help_button=hide_help_by_default and not help_visible,
@@ -1514,6 +1525,12 @@ def main() -> None:
     parser.add_argument("--sync-google-calendar", action="store_true")
     parser.add_argument("--google-credentials", type=Path)
     parser.add_argument("--hide-help-by-default", action="store_true")
+    parser.add_argument(
+        "--recent-only-after-hours",
+        type=parse_hours,
+        metavar="HOURS",
+        help="only ask about the last 30 minutes when unaccounted time exceeds HOURS",
+    )
     args = parser.parse_args()
 
     if args.setup_google_calendar:
@@ -1536,7 +1553,14 @@ def main() -> None:
         print(f"ICS mirror: {google_calendar_ics_path(log_dir)}")
         raise SystemExit(0)
 
-    raise SystemExit(run(args.notes_dir, local_now(), args.hide_help_by_default))
+    raise SystemExit(
+        run(
+            args.notes_dir,
+            local_now(),
+            hide_help_by_default=args.hide_help_by_default,
+            recent_only_after_hours=args.recent_only_after_hours,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -627,6 +627,67 @@ def test_runtime_state_ignores_future_calendar_events(tmp_path: Path) -> None:
     assert state["last_activity"] == "work"
 
 
+@pytest.mark.parametrize(
+    ("last_activity_end", "recent_only_after_hours", "expected_start", "is_recent_only"),
+    [
+        (at(4), 6, at(10, 30), True),
+        (at(4), None, at(4), False),
+        (at(5), 6, at(5), False),
+    ],
+)
+def test_recent_only_threshold_controls_unaccounted_period(
+    monkeypatch,
+    tmp_path: Path,
+    last_activity_end: datetime,
+    recent_only_after_hours: float | None,
+    expected_start: datetime,
+    is_recent_only: bool,
+) -> None:
+    log_dir = tmp_path / time_allocation_popup.LOG_DIR_NAME
+    log_dir.mkdir()
+    previous_segment = time_allocation_popup.ActivitySegment(
+        "sleep",
+        last_activity_end - timedelta(hours=1),
+        last_activity_end,
+    )
+    time_allocation_popup.save_state(
+        log_dir,
+        [previous_segment],
+        time_allocation_popup.default_state(previous_segment.start),
+    )
+    prompts: list[str] = []
+
+    def fake_ask_with_yad(
+        message: str,
+        entry_text: str = "",
+        show_help_button: bool = False,
+    ) -> time_allocation_popup.PopupResponse:
+        prompts.append(message)
+        return time_allocation_popup.PopupResponse(
+            time_allocation_popup.LOG_ACTION,
+            "work",
+        )
+
+    monkeypatch.setattr(time_allocation_popup, "ask_with_yad", fake_ask_with_yad)
+    monkeypatch.setattr(
+        time_allocation_popup,
+        "refresh_google_calendar_snapshot",
+        lambda *args, **kwargs: None,
+    )
+
+    status = time_allocation_popup.run(
+        tmp_path,
+        at(11),
+        recent_only_after_hours=recent_only_after_hours,
+    )
+
+    assert status == 0
+    assert ("Only the last 30m needs logging." in prompts[0]) is is_recent_only
+    queued_event = read_outbox(log_dir)["events"][0]
+    assert queued_event["start"] == expected_start.isoformat()
+    assert queued_event["end"] == at(11).isoformat()
+
+
 def test_invalid_input_reopens_prompt_with_previous_text(monkeypatch, tmp_path: Path) -> None:
     prompts: list[tuple[str, str]] = []
     responses = iter(
