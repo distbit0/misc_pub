@@ -16,6 +16,7 @@ import sys
 from zoneinfo import ZoneInfo
 
 DEFAULT_LOOKBACK = timedelta(minutes=30)
+DEFAULT_RECENT_ONLY_AFTER_HOURS = 6
 POPUP_TIMEOUT_SECONDS = 4 * 60
 POPUP_FONT = "Sans 18"
 STATUS_FONT = POPUP_FONT
@@ -139,7 +140,7 @@ def parse_iso_datetime(value: object, field_name: str) -> datetime:
     return parsed
 
 
-def parse_hours(value: str) -> float:
+def parse_hour_value(value: str) -> float:
     stripped = value.strip()
     if stripped.startswith("."):
         stripped = f"0{stripped}"
@@ -147,8 +148,20 @@ def parse_hours(value: str) -> float:
         hours = float(stripped)
     except ValueError as error:
         raise ValueError(f"Expected duration in hours, got: {value!r}") from error
+    return hours
+
+
+def parse_hours(value: str) -> float:
+    hours = parse_hour_value(value)
     if hours <= 0:
         raise ValueError(f"Duration must be positive, got: {value!r}")
+    return hours
+
+
+def parse_nonnegative_hours(value: str) -> float:
+    hours = parse_hour_value(value)
+    if hours < 0:
+        raise ValueError(f"Hours cannot be negative, got: {value!r}")
     return hours
 
 
@@ -1424,7 +1437,7 @@ def run(
     notes_dir: Path,
     now: datetime,
     hide_help_by_default: bool = False,
-    recent_only_after_hours: float | None = None,
+    recent_only_after_hours: float = DEFAULT_RECENT_ONLY_AFTER_HOURS,
 ) -> int:
     log_dir = notes_dir / LOG_DIR_NAME
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1445,7 +1458,7 @@ def run(
         print("No unaccounted time yet.", file=sys.stderr)
         return 0
     recent_only = (
-        recent_only_after_hours is not None
+        recent_only_after_hours > 0
         and now - period_start > timedelta(hours=recent_only_after_hours)
     )
     if recent_only:
@@ -1528,9 +1541,10 @@ def main() -> None:
     parser.add_argument("--hide-help-by-default", action="store_true")
     parser.add_argument(
         "--recent-only-after-hours",
-        type=parse_hours,
+        type=parse_nonnegative_hours,
+        default=DEFAULT_RECENT_ONLY_AFTER_HOURS,
         metavar="HOURS",
-        help="only ask about the last 30 minutes when unaccounted time exceeds HOURS",
+        help="limit long-gap prompts to the last 30 minutes (default: 6; 0 disables)",
     )
     args = parser.parse_args()
 

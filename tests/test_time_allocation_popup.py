@@ -350,6 +350,12 @@ def test_activity_duration_pairs_reject_missing_duration() -> None:
         time_allocation_popup.parse_activity_segments("brunch,work", at(10), at(15))
 
 
+def test_recent_only_threshold_accepts_zero_but_not_negative() -> None:
+    assert time_allocation_popup.parse_nonnegative_hours("0") == 0
+    with pytest.raises(ValueError, match="cannot be negative"):
+        time_allocation_popup.parse_nonnegative_hours("-1")
+
+
 def test_review_text_splits_segments_at_midnight() -> None:
     start = datetime(2026, 7, 2, 23, 30, tzinfo=LOCAL_TZ)
     end = datetime(2026, 7, 3, 0, 30, tzinfo=LOCAL_TZ)
@@ -630,9 +636,10 @@ def test_runtime_state_ignores_future_calendar_events(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("last_activity_end", "recent_only_after_hours", "expected_start", "is_recent_only"),
     [
-        (at(4), 6, at(10, 30), True),
-        (at(4), None, at(4), False),
-        (at(5), 6, at(5), False),
+        (at(4), None, at(10, 30), True),
+        (at(4), 0, at(4), False),
+        (at(5), None, at(5), False),
+        (at(2), 8, at(10, 30), True),
     ],
 )
 def test_recent_only_threshold_controls_unaccounted_period(
@@ -675,11 +682,16 @@ def test_recent_only_threshold_controls_unaccounted_period(
         lambda *args, **kwargs: None,
     )
 
+    threshold_arguments = (
+        {}
+        if recent_only_after_hours is None
+        else {"recent_only_after_hours": recent_only_after_hours}
+    )
     status = time_allocation_popup.run(
         tmp_path,
         at(11),
         hide_help_by_default=True,
-        recent_only_after_hours=recent_only_after_hours,
+        **threshold_arguments,
     )
 
     assert status == 0
