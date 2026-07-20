@@ -1357,11 +1357,12 @@ def popup_text(
             f"{last_activity} ({time_since_last_activity} ago) @ {last_activity_end_text}"
         )
 
-    status_lines = [last_activity_line]
-    if last_activity_duration is not None:
-        status_lines.append(f"len {last_activity_duration}")
     if recent_only:
-        status_lines.append("Only the last 30m needs logging.")
+        status_lines = ["last 30m"]
+    else:
+        status_lines = [last_activity_line]
+        if last_activity_duration is not None:
+            status_lines.append(f"len {last_activity_duration}")
     status_text = html.escape("\n".join(status_lines))
     error_block = (
         f'<span><b>Error:</b> {html.escape(error_message)}</span>\n\n'

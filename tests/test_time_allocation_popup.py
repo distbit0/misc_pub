@@ -678,11 +678,19 @@ def test_recent_only_threshold_controls_unaccounted_period(
     status = time_allocation_popup.run(
         tmp_path,
         at(11),
+        hide_help_by_default=True,
         recent_only_after_hours=recent_only_after_hours,
     )
 
     assert status == 0
-    assert ("Only the last 30m needs logging." in prompts[0]) is is_recent_only
+    if is_recent_only:
+        assert "<b>last 30m</b>" in prompts[0]
+        assert "sleep" not in prompts[0]
+        assert "ago" not in prompts[0]
+        assert "len " not in prompts[0]
+    else:
+        assert "last 30m" not in prompts[0]
+        assert "sleep" in prompts[0]
     queued_event = read_outbox(log_dir)["events"][0]
     assert queued_event["start"] == expected_start.isoformat()
     assert queued_event["end"] == at(11).isoformat()
